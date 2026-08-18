@@ -1,21 +1,38 @@
 """
-T.QM.013 检验指导书自动生成工具 — Streamlit 版
-部署到 Streamlit Cloud，永久在线使用
+T.QM.013 检验指导书自动生成工具 — Streamlit 增强版
 """
 import os
-import tempfile
+import glob
 from datetime import datetime
 from io import BytesIO
 
 import streamlit as st
 import openpyxl
-from openpyxl.utils import get_column_letter
 
-# ==================== 配置 ====================
-# ★ 改成你仓库中模板文件的实际文件名 ★
-TEMPLATE_FILE = 'T.QM.013.xlsm'
+# ==================== 自动查找模板文件 ====================
+# 在仓库根目录自动搜索 .xlsm 模板文件
+TEMPLATE_FILE = None
 
-# T.QM.013 模板单元格映射 (row, col)
+# 先尝试固定文件名
+FIXED_NAMES = [
+    'T.QM.013_Template.xlsm',
+    'T.QM.013_Work and Test Instruction_Arbeits und Prüfanweisung_Rev 2026_05 (1).xlsm',
+]
+
+for name in FIXED_NAMES:
+    if os.path.exists(name):
+        TEMPLATE_FILE = name
+        break
+
+# 再尝试模糊搜索
+if TEMPLATE_FILE is None:
+    xlsm_files = glob.glob('*.xlsm') + glob.glob('*.xlsx')
+    for f in xlsm_files:
+        if 'T.QM.013' in f or 'QM.013' in f:
+            TEMPLATE_FILE = f
+            break
+
+# ==================== T.QM.013 模板单元格映射 ====================
 TQM013_CELL_MAP = {
     'language':       (5, 13),
     'dmba':           (7, 13),
@@ -31,9 +48,8 @@ TQM013_CELL_MAP = {
     'content_end_row': 48,
 }
 
-# ==================== 核心函数 ====================
 
-def parse_control_plan(file_bytes, filename):
+def parse_control_plan(file_bytes):
     """解析上传的控制计划 Excel"""
     wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
     ws = wb.active
@@ -84,7 +100,6 @@ def parse_control_plan(file_bytes, filename):
 
 
 def smart_match_columns(cp_headers):
-    """智能匹配控制计划列 → T.QM.013 内容列"""
     rules = {
         'content_c':      ['内容', 'content', 'inhalt', '工序', 'process', 'vorgang', 'nr'],
         'content_d':      ['d', '分类', 'class', 'klasse'],
@@ -111,12 +126,15 @@ def smart_match_columns(cp_headers):
 
 
 def fill_template(cp_data, selected_ws, column_mapping):
-    """基于 T.QM.013 模板填充数据，返回 BytesIO"""
-    if not os.path.exists(TEMPLATE_FILE):
-        st.error(f"❌ 模板文件未找到: {TEMPLATE_FILE}")
-        return None
+    """基于 T.QM.013 模板填充数据"""
+    if TEMPLATE_FILE is None:
+        raise FileNotFoundError(
+            "未找到 T.QM.013 模板文件！\n"
+            "请确保已将 .xlsm 模板文件上传到 GitHub 仓库根目录。\n"
+            f"当前仓库根目录文件列表: {os.listdir('.')}"
+        )
 
-    wb = openpyxl.load_workbook(TEMPLATE_FILE)
+    wb = openpyxl.load_workbook(TEMPLATE_FILE, keep_vba=True)
     ws = wb.active
     cm = TQM013_CELL_MAP
 
@@ -125,7 +143,6 @@ def fill_template(cp_data, selected_ws, column_mapping):
     ws.cell(row=cm['instruction'][0], column=cm['instruction'][1], value='ON')
     ws.cell(row=cm['workstation'][0], column=cm['workstation'][1], value=selected_ws)
 
-    # 筛选匹配工位的数据行
     ws_col = cp_data['workstation_col']
     matched = []
     for row_data in cp_data['data']:
@@ -145,7 +162,6 @@ def fill_template(cp_data, selected_ws, column_mapping):
             seen.add(key)
             unique_matched.append(row)
 
-    # 填充内容
     content_cols = cm['content_cols']
     current_row = cm['content_start_row']
     for row_data in unique_matched:
@@ -167,11 +183,17 @@ def fill_template(cp_data, selected_ws, column_mapping):
 
 
 # ==================== Streamlit 界面 ====================
-
 st.set_page_config(page_title="T.QM.013 检验指导书生成器", page_icon="📋", layout="wide")
 
 st.title("📋 T.QM.013 检验指导书生成器")
 st.caption("上传版本控制计划 → 选择工位/OP → 确认列映射 → 生成检验指导书")
+
+# 显示模板文件状态
+if TEMPLATE_FILE:
+    st.sidebar.success(f"✅ 模板: {TEMPLATE_FILE}")
+else:
+    st.sidebar.error("❌ 未找到模板文件！")
+    st.sidebar.info(f"仓库文件: {os.listdir('.')}")
 
 # 初始化 session state
 for key, default in {
@@ -182,8 +204,8 @@ for key, default in {
         st.session_state[key] = default
 
 # ====== 步骤指示器 ======
-cols = st.columns(4)
 steps = ["① 上传控制计划", "② 选择工位/OP", "③ 确认列映射", "④ 生成 & 下载"]
+cols = st.columns(4)
 for i, (col, label) in enumerate(zip(cols, steps)):
     with col:
         if i + 1 < st.session_state.step:
@@ -195,7 +217,7 @@ for i, (col, label) in enumerate(zip(cols, steps)):
 
 st.divider()
 
-# ====== Step 1: 上传 ======
+# ====== Step 1 ======
 if st.session_state.step == 1:
     st.subheader("步骤 1：上传版本控制计划 Excel")
     uploaded = st.file_uploader(
@@ -206,15 +228,17 @@ if st.session_state.step == 1:
     if uploaded:
         with st.spinner("正在解析文件..."):
             try:
-                cp_data = parse_control_plan(uploaded.getvalue(), uploaded.name)
+                cp_data = parse_control_plan(uploaded.getvalue())
                 st.session_state.cp_data = cp_data
                 st.success(f"✅ 解析成功！共 {len(cp_data['data'])} 行数据，{len(cp_data['workstations'])} 个工位/OP")
                 st.info(f"工位列: 第 {cp_data['workstation_col']} 列")
-                st.button("下一步：选择工位 →", on_click=lambda: setattr(st.session_state, 'step', 2))
+                if st.button("下一步：选择工位 →"):
+                    st.session_state.step = 2
+                    st.rerun()
             except Exception as e:
                 st.error(f"解析失败: {e}")
 
-# ====== Step 2: 选择工位 ======
+# ====== Step 2 ======
 elif st.session_state.step == 2:
     st.subheader("步骤 2：选择目标工位/OP")
 
@@ -223,28 +247,37 @@ elif st.session_state.step == 2:
 
     filtered = [w for w in workstations if search.lower() in str(w).lower()] if search else workstations
 
-    cols_per_row = 8
+    cols_per_row = 6
     for i in range(0, len(filtered), cols_per_row):
         row_cols = st.columns(cols_per_row)
         for j, ws_name in enumerate(filtered[i:i+cols_per_row]):
             with row_cols[j]:
                 is_selected = (st.session_state.selected_ws == ws_name)
-                btn_label = f"✅ {ws_name}" if is_selected else ws_name
-                if st.button(btn_label, key=f"ws_{ws_name}", use_container_width=True,
-                             type="primary" if is_selected else "secondary"):
+                if st.button(
+                    f"✅ {ws_name}" if is_selected else str(ws_name),
+                    key=f"ws_{ws_name}",
+                    use_container_width=True,
+                    type="primary" if is_selected else "secondary"
+                ):
                     st.session_state.selected_ws = ws_name
+                    st.rerun()
 
     if st.session_state.selected_ws:
         st.success(f"已选择: **{st.session_state.selected_ws}**")
 
     c1, c2 = st.columns(2)
     with c1:
-        st.button("← 重新上传", on_click=lambda: reset_to_step(1))
+        if st.button("← 重新上传"):
+            for k in ['cp_data', 'selected_ws', 'column_mapping', 'output_file', 'output_name']:
+                st.session_state[k] = None if k != 'column_mapping' else {}
+            st.session_state.step = 1
+            st.rerun()
     with c2:
-        st.button("下一步：确认映射 →", disabled=(st.session_state.selected_ws is None),
-                  on_click=lambda: go_to_mapping())
+        if st.button("下一步：确认映射 →", disabled=(st.session_state.selected_ws is None)):
+            st.session_state.step = 3
+            st.rerun()
 
-# ====== Step 3: 列映射 ======
+# ====== Step 3 ======
 elif st.session_state.step == 3:
     st.subheader(f"步骤 3：确认列映射关系（工位: {st.session_state.selected_ws}）")
     st.caption("系统已自动匹配，如需调整请手动选择。")
@@ -260,15 +293,17 @@ elif st.session_state.step == 3:
         'test_level_eq': '试验等级/设备', 'responsible': '负责人',
     }
 
-    cp_options = {f"列{idx}: {hdr}" if hdr else f"列{idx} (空)": idx
-                  for idx, hdr in cp_headers.items()}
-    option_labels = list(cp_options.keys())
-    option_labels.insert(0, "-- 不映射 --")
+    cp_options = {}
+    for idx, hdr in cp_headers.items():
+        label = f"列{idx}: {hdr}" if hdr else f"列{idx} (空)"
+        cp_options[label] = idx
+
+    option_labels = ["-- 不映射 --"] + list(cp_options.keys())
 
     final_mapping = {}
     for tqm_col, label in tqm_labels.items():
         default_idx = auto_mapping.get(tqm_col)
-        if default_idx:
+        if default_idx is not None:
             default_hdr = cp_headers.get(default_idx, '')
             default_label = f"列{default_idx}: {default_hdr}" if default_hdr else f"列{default_idx} (空)"
         else:
@@ -280,7 +315,7 @@ elif st.session_state.step == 3:
         selected_label = st.selectbox(
             f"**{label}**  ← 对应",
             option_labels,
-            index=option_labels.index(default_label) if default_label in option_labels else 0,
+            index=option_labels.index(default_label),
             key=f"map_{tqm_col}"
         )
         if selected_label != "-- 不映射 --":
@@ -290,7 +325,9 @@ elif st.session_state.step == 3:
 
     c1, c2 = st.columns(2)
     with c1:
-        st.button("← 返回选择工位", on_click=lambda: setattr(st.session_state, 'step', 2))
+        if st.button("← 返回选择工位"):
+            st.session_state.step = 2
+            st.rerun()
     with c2:
         if st.button("🚀 生成检验指导书", type="primary"):
             with st.spinner("正在生成..."):
@@ -308,12 +345,12 @@ elif st.session_state.step == 3:
                         )
                         st.session_state.step = 4
                         st.rerun()
-                    else:
-                        st.error("生成失败：模板文件未找到。")
                 except Exception as e:
                     st.error(f"生成失败: {e}")
+                    st.info(f"模板文件: {TEMPLATE_FILE}")
+                    st.info(f"仓库文件列表: {os.listdir('.')}")
 
-# ====== Step 4: 下载 ======
+# ====== Step 4 ======
 elif st.session_state.step == 4:
     st.subheader("✅ 步骤 4：生成完成！")
     st.success(f"检验指导书已生成：**{st.session_state.output_name}**")
@@ -326,18 +363,8 @@ elif st.session_state.step == 4:
         type="primary"
     )
 
-    st.button("🔄 生成新的指导书", on_click=lambda: reset_to_step(1))
-
-
-def reset_to_step(step):
-    if step == 1:
-        st.session_state.cp_data = None
-        st.session_state.selected_ws = None
-        st.session_state.column_mapping = {}
-        st.session_state.output_file = None
-        st.session_state.output_name = ''
-    st.session_state.step = step
-
-
-def go_to_mapping():
-    st.session_state.step = 3
+    if st.button("🔄 生成新的指导书"):
+        for k in ['cp_data', 'selected_ws', 'column_mapping', 'output_file', 'output_name']:
+            st.session_state[k] = None if k != 'column_mapping' else {}
+        st.session_state.step = 1
+        st.rerun()
