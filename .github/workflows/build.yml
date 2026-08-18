@@ -24,7 +24,7 @@ jobs:
 
       - name: PyInstaller 打包
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name "TQM013检验指导书生成器" --add-data "template\T.QM.013_Template.xlsm;template" --hidden-import flask --hidden-import openpyxl --hidden-import werkzeug app.py
+          pyinstaller --noconfirm --onefile --windowed --name "TQM013检验指导书生成器" --add-data "template\T.QM.013.xlsm;template" --hidden-import flask --hidden-import openpyxl --hidden-import werkzeug app.py
 
       - name: 上传 EXE 产物
         uses: actions/upload-artifact@v4
