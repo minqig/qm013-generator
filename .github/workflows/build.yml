@@ -1,0 +1,33 @@
+name: 打包 EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install flask openpyxl pyinstaller
+
+      - name: PyInstaller 打包
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name "TQM013检验指导书生成器" --add-data "template\T.QM.013_Template.xlsm;template" --hidden-import flask --hidden-import openpyxl --hidden-import werkzeug app.py
+
+      - name: 上传 EXE 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: TQM013_Generator
+          path: dist\TQM013检验指导书生成器.exe
