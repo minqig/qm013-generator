@@ -414,7 +414,7 @@ def generate():
 
         safe_ws = secure_filename(str(workstation))
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_filename = f"T.QM.013_{safe_ws}_{timestamp}.xlsx"
+        output_filename = f"T.QM.013_{safe_ws}_{timestamp}.xlsm"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
 
         output = fill_template(cp_data, workstation, hm, cm)
