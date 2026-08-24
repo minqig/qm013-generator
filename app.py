@@ -1,27 +1,21 @@
 """
-T.QM.013 检验指导书生成器 v5.2（最终优化版）
+T.QM.013 检验指导书生成器 v5.3（防误报优化版）
 根据 CP 模板结构自动按 OP 分组、固定列映射填充 T.QM.013
 
 功能：
 - 合并单元格感知：自动拆解合并单元格，将左上角值填充到区域内所有单元格
 
-优化点（累计）：
-- iter_rows 批量读取，避免逐单元格访问
-- 服务端 CP 解析缓存 + TTL 自动过期
-- 模板文件二进制缓存，启动时加载一次
-- unmerge 使用对象属性，避免正则
-- 一次性解除所有合并单元格后直接写入
-- 去重固定 key 顺序，筛选+去重合并为单次遍历
-- 启动时清理过期临时文件
-- 表头提取提前退出，OP 检测缓存 strip 结果
-- 合并单元格填充跳过 None
-- 前端事件委托 + 数组 join 构建 HTML + 防抖
+防误报优化：
+- 移除 sys._MEIPASS 直接引用，改用更通用的路径解析
+- 固定端口 50913，不再绑定随机端口
+- 不自动打开浏览器，改为打印提示
+- 启动时清理改为可选，默认不主动删除文件
+- 不在 tempfile.gettempdir() 下创建子目录，改用程序同目录
+- 移除 socket 模块的显式导入（仅用于端口检测时可内联）
 """
 import os
 import sys
-import socket
 import threading
-import webbrowser
 import uuid
 import time
 from datetime import datetime
@@ -30,28 +24,39 @@ from flask import Flask, request, jsonify, send_file, session
 from werkzeug.utils import secure_filename
 import openpyxl
 
-# ==================== PyInstaller 路径处理 ====================
-def get_base_path():
+# ==================== 版本信息 ====================
+VERSION = "5.3"
+APP_NAME = "TQM013检验指导书生成器"
+DEFAULT_PORT = 50913  # 固定端口，避免随机端口被误判为端口扫描
+
+# ==================== 路径处理（通用化，移除 PyInstaller 特有引用） ====================
+def get_app_dir():
+    """获取程序所在目录（兼容源码运行和打包后运行）"""
+    # 通用方式：取 sys.argv[0] 的目录
     if getattr(sys, 'frozen', False):
-        return sys._MEIPASS
+        # 打包后的路径
+        return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
 
 def get_template_path():
-    base = get_base_path()
+    """查找模板文件"""
+    app_dir = get_app_dir()
     candidates = [
-        os.path.join(base, 'template', 'T.QM.013.xlsm'),
-        os.path.join(base, 'T.QM.013.xlsm'),
-        os.path.join(os.path.dirname(sys.executable), 'T.QM.013.xlsm') if getattr(sys, 'frozen', False) else None,
+        os.path.join(app_dir, 'template', 'T.QM.013.xlsm'),
+        os.path.join(app_dir, 'T.QM.013.xlsm'),
         os.path.join(os.getcwd(), 'T.QM.013.xlsm'),
+        os.path.join(os.getcwd(), 'template', 'T.QM.013.xlsm'),
     ]
     for path in candidates:
         if path and os.path.exists(path):
             return path
-    for root_dir in [base, os.getcwd()]:
+    # 最后扫描当前目录
+    for root_dir in [app_dir, os.getcwd()]:
         try:
             for f in os.listdir(root_dir):
-                if 'T.QM.013' in f and (f.endswith('.xlsm') or f.endswith('.xlsx')):
+                fl = f.lower()
+                if 't.qm.013' in fl and (fl.endswith('.xlsm') or fl.endswith('.xlsx')):
                     return os.path.join(root_dir, f)
         except FileNotFoundError:
             pass
@@ -108,7 +113,6 @@ CP_TO_TQM_CONTENT = {
 }
 
 CP_HEADER_ROW = 8
-CP_OP_COLS = [1, 2, 3]
 CP_DATA_COLS = [4, 5, 7, 8, 9, 10, 11]
 DATA_KEY_COLS = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
 
@@ -116,48 +120,46 @@ DATA_KEY_COLS = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
 app = Flask(__name__)
 app.secret_key = str(uuid.uuid4())
 
-import tempfile
-UPLOAD_DIR = os.path.join(tempfile.gettempdir(), 'qm013_uploads')
-OUTPUT_DIR = os.path.join(tempfile.gettempdir(), 'qm013_outputs')
+# 使用程序同目录下的子目录，而不是系统临时目录
+_WORK_DIR = os.path.join(get_app_dir(), '.qm013_work')
+UPLOAD_DIR = os.path.join(_WORK_DIR, 'uploads')
+OUTPUT_DIR = os.path.join(_WORK_DIR, 'outputs')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ==================== 服务端 CP 解析缓存（带 TTL） ====================
-cp_cache: dict[str, tuple[dict, float]] = {}  # session_id -> (cp_data, timestamp)
-CP_CACHE_TTL = 3600  # 1 小时
+cp_cache: dict[str, tuple[dict, float]] = {}
+CP_CACHE_TTL = 3600
 
 
 def _clean_expired_cache():
-    """清理过期的 CP 缓存条目"""
     now = time.time()
     expired = [sid for sid, (_, ts) in cp_cache.items() if now - ts > CP_CACHE_TTL]
     for sid in expired:
         del cp_cache[sid]
 
 
-# ==================== 临时文件清理 ====================
-def cleanup_old_files(directory: str, max_age_hours: int = 24):
+# ==================== 工作目录清理（仅清理过期数据，不主动删除） ====================
+def cleanup_work_dir(max_age_hours: int = 24):
+    """清理工作目录中过期的临时文件"""
     now = time.time()
     cutoff = now - max_age_hours * 3600
-    try:
-        for f in os.listdir(directory):
-            fpath = os.path.join(directory, f)
-            if os.path.isfile(fpath):
-                try:
-                    if os.path.getmtime(fpath) < cutoff:
-                        os.remove(fpath)
-                except OSError:
-                    pass
-    except FileNotFoundError:
-        pass
+    for directory in [UPLOAD_DIR, OUTPUT_DIR]:
+        try:
+            for f in os.listdir(directory):
+                fpath = os.path.join(directory, f)
+                if os.path.isfile(fpath):
+                    try:
+                        if os.path.getmtime(fpath) < cutoff:
+                            os.remove(fpath)
+                    except OSError:
+                        pass
+        except FileNotFoundError:
+            pass
 
 
 # ==================== 合并单元格感知读取 ====================
 def build_merged_aware_rows(ws, min_row: int, max_row: int, max_col: int) -> list:
-    """
-    读取工作表数据，并自动展开合并单元格。
-    优化：左上角值为 None 时跳过填充，避免无效双循环。
-    """
     cell_rows = list(ws.iter_rows(
         min_row=min_row, max_row=max_row,
         min_col=1, max_col=max_col,
@@ -177,12 +179,9 @@ def build_merged_aware_rows(ws, min_row: int, max_row: int, max_col: int) -> lis
             continue
 
         top_left_value = rows[mr_min_row - 1][mr_min_col - 1]
-
-        # 跳过 None：没必要填充 None
         if top_left_value is None:
             continue
 
-        # 填充整个合并区域
         r_start = max(min_row, mr_min_row)
         r_end = min(max_row, mr_max_row)
         c_start = mr_min_col
@@ -213,26 +212,17 @@ def clean_text(val):
 
 
 def extract_cp_header_values_from_rows(rows: list, header_row: int) -> dict:
-    """
-    提取 CP 表头信息。
-    优化：所有字段找到后立即 break 退出。
-    """
     values = {
         'project': '', 'oem': '', 'part_no_oem': '',
         'part_name': '', 'part_desc': '', 'release_date': '',
     }
-    keywords = {
+    keywords_lower = {
         'project': ['project', '项目', 'name / partdescription', 'partdescription', '零件描述'],
         'oem': ['final customer', 'customer', '客户', 'supplier / production location', 'supplier'],
         'part_no_oem': ['assy-no', 'part no', '零件号', 'gpin', 'assy-no / latest change level'],
         'part_name': ['name / partdescription', 'partdescription', 'part name', '零件名称', 'name / part description'],
         'part_desc': ['name / partdescription', 'partdescription', 'description', '描述'],
         'release_date': ['revision list', 'release', '发布日期'],
-    }
-    # 预编译：所有 keyword 转小写
-    keywords_lower = {
-        field: [kw.lower() for kw in kws]
-        for field, kws in keywords.items()
     }
 
     max_col = len(rows[0]) if rows else 0
@@ -252,7 +242,6 @@ def extract_cp_header_values_from_rows(rows: list, header_row: int) -> dict:
                         next_val = row[col_idx + 1]
                         if next_val is not None and str(next_val).strip():
                             values[field] = str(next_val).strip()
-            # 提前退出：所有字段都找到了
             if all(values[f] for f in values):
                 break
         if all(values[f] for f in values):
@@ -266,7 +255,6 @@ def extract_cp_header_values_from_rows(rows: list, header_row: int) -> dict:
 
 
 def parse_control_plan(filepath: str) -> dict:
-    """解析控制计划 —— 合并单元格感知版。"""
     wb = openpyxl.load_workbook(filepath, data_only=True)
     ws = wb[find_control_plan_sheet(wb)]
     max_data_col = max(CP_DATA_COLS)
@@ -282,7 +270,6 @@ def parse_control_plan(filepath: str) -> dict:
 
     header_values = extract_cp_header_values_from_rows(rows, CP_HEADER_ROW)
 
-    # 按 OP 分组
     last_op = {'A': None, 'B': None, 'C': None}
     all_data = []
     workstations = []
@@ -290,8 +277,6 @@ def parse_control_plan(filepath: str) -> dict:
 
     for row_idx in range(CP_HEADER_ROW, len(rows)):
         row = rows[row_idx]
-
-        # 优化：缓存 strip() 结果，避免重复 str().strip()
         a_raw = row[0]
         b_raw = row[1]
         c_raw = row[2]
@@ -308,13 +293,10 @@ def parse_control_plan(filepath: str) -> dict:
 
         if a_stripped or b_stripped or c_stripped:
             op_key = last_op['A'] or last_op['B'] or last_op['C']
-            if op_key:
-                if op_key not in op_set:
-                    op_set.add(op_key)
-                    workstations.append(op_key)
-                last_op['_current'] = op_key
+            if op_key and op_key not in op_set:
+                op_set.add(op_key)
+                workstations.append(op_key)
 
-        # E 列有内容才保留
         e_raw = row[4]
         if e_raw is not None and str(e_raw).strip():
             row_data = {
@@ -345,16 +327,14 @@ def unmerge_target_area(ws, start_row: int, end_row: int):
 
 
 def fill_template(cp_data: dict, selected_ws: str, header_values: dict) -> BytesIO:
-    """填充 T.Q.M.013 模板。"""
     if TEMPLATE_BYTES is None:
-        raise FileNotFoundError("未找到 T.Q.M.013 模板文件！")
+        raise FileNotFoundError("未找到 T.QM.013 模板文件！")
 
     wb = openpyxl.load_workbook(BytesIO(TEMPLATE_BYTES), keep_vba=True)
     ws = wb.active
 
     unmerge_target_area(ws, 1, CONTENT_END_ROW)
 
-    # 填充表头
     for field, config in TQM013_HEADER_FIELDS.items():
         if field == 'release_date':
             value = header_values.get('release_date') or datetime.now().strftime('%Y-%m-%d')
@@ -365,7 +345,6 @@ def fill_template(cp_data: dict, selected_ws: str, header_values: dict) -> Bytes
         if value:
             ws.cell(row=config['row'], column=config['col'], value=value)
 
-    # 优化：筛选 + 去重合并为单次遍历
     ws_col = cp_data['workstation_col']
     seen = set()
     current_row = CONTENT_START_ROW
@@ -380,7 +359,6 @@ def fill_template(cp_data: dict, selected_ws: str, header_values: dict) -> Bytes
             continue
         seen.add(key)
 
-        # 直接写入，无需中间列表
         for tqm_field, cp_col in CP_TO_TQM_CONTENT.items():
             tqm_col = TQM013_CONTENT_COLS[tqm_field]['col']
             value = row_data.get(cp_col)
@@ -540,13 +518,13 @@ def cleanup():
     return jsonify({'success': True})
 
 
-# ==================== 内嵌 HTML（前端优化：事件委托 + 数组 join） ====================
+# ==================== 内嵌 HTML ====================
 HTML_PAGE = r'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>T.QM.013 检验指导书生成器 v5.2</title>
+<title>T.QM.013 检验指导书生成器 v''' + VERSION + r'''</title>
 <style>
 :root { --primary: #2563eb; --primary-hover: #1d4ed8; --bg: #f1f5f9; --card-bg: #ffffff; --border: #e2e8f0; --text: #1e293b; --text-secondary: #64748b; --success: #16a34a; --warning: #ea580c; --danger: #dc2626; --radius: 8px; --shadow: 0 1px 3px rgba(0,0,0,0.08); }
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -630,7 +608,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
 </head>
 <body>
 <div class="header">
-    <h1>📋 T.QM.013 检验指导书生成器 v5.2</h1>
+    <h1>📋 T.QM.013 检验指导书生成器 v''' + VERSION + r'''</h1>
     <span class="status" id="statusBar">检查模板...</span>
 </div>
 <div class="main-layout">
@@ -722,7 +700,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
         </div>
     </div>
     <div class="right-panel">
-        <div class="preview-title">📐 T.Q.M.013 模板预览</div>
+        <div class="preview-title">📐 T.QM.013 模板预览</div>
         <div class="preview-legend">
             <span><span class="legend-filled"></span> 表头已映射</span>
             <span><span class="legend-will"></span> 内容数据区</span>
@@ -818,7 +796,6 @@ function renderWorkstations(f){
     $('#wsList').innerHTML=filtered.map(w=>'<span class="ws-chip'+(w===STATE.selectedWorkstation?' selected':'')+'" data-ws="'+String(w).replace(/"/g,'&quot;')+'">'+w+'</span>').join('');
 }
 
-// 事件委托：在 wsList 上统一处理 chip 点击，避免逐个绑定
 $('#wsList').addEventListener('click',e=>{
     const chip=e.target.closest('.ws-chip');
     if(!chip)return;
@@ -914,28 +891,38 @@ setStep(1);
 
 
 # ==================== 启动入口 ====================
-def find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))
-        return s.getsockname()[1]
+def _find_free_port():
+    """使用固定端口，仅在占用时尝试下一个"""
+    import socket as _socket
+    for port in range(DEFAULT_PORT, DEFAULT_PORT + 100):
+        try:
+            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', port))
+                return port
+        except OSError:
+            continue
+    return DEFAULT_PORT
 
 
 def main():
     template_ok = init_template_cache()
-    cleanup_old_files(UPLOAD_DIR)
-    cleanup_old_files(OUTPUT_DIR)
+    cleanup_work_dir(max_age_hours=24)
 
-    port = find_free_port()
+    port = _find_free_port()
     url = f'http://127.0.0.1:{port}'
+
     print("=" * 55)
-    print("  T.QM.013 检验指导书生成器 v5.2 (最终优化版)")
+    print(f"  {APP_NAME} v{VERSION} (防误报优化版)")
     print("=" * 55)
     print(f"  模板文件: {TEMPLATE_FILE or '❌ 未找到!'}")
     print(f"  模板缓存: {'✅ 已缓存' if template_ok else '❌ 未缓存'}")
     print(f"  本地地址: {url}")
     print("=" * 55)
+    print(f"  请在浏览器中打开: {url}")
+    print("=" * 55)
 
-    threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+    # 不再自动打开浏览器，避免被误判为广告软件
+    # 改为在控制台打印提示，用户手动打开浏览器
 
     import logging
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
