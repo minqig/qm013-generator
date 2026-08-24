@@ -1,20 +1,22 @@
 """
-T.QM.013 检验指导书生成器 v5.0（性能优化版）
+T.QM.013 检验指导书生成器 v5.1（合并单元格感知 + 性能优化版）
 根据 CP 模板结构自动按 OP 分组、固定列映射填充 T.QM.013
 
+新增功能：
+- 合并单元格感知：自动拆解合并单元格，将左上角值填充到区域内所有单元格
+
 优化点：
-- iter_rows + values_only 批量读取，避免逐单元格访问
+- iter_rows 批量读取，避免逐单元格访问
 - 服务端 CP 解析缓存，避免重复 load_workbook
 - 模板文件二进制缓存，启动时加载一次
 - unmerge 使用对象属性，避免正则
-- 一次性解除所有合并单元格后直接写入，移除 safe_write_cell
-- 去重固定 key 顺序，避免 sorted()
+- 一次性解除所有合并单元格后直接写入，无需 safe_write_cell
+- 去重固定 key 顺序
 - 启动时清理过期临时文件
 - 前端 updatePreview 防抖
 """
 import os
 import sys
-import re
 import socket
 import threading
 import webbrowser
@@ -57,7 +59,6 @@ def get_template_path():
 TEMPLATE_FILE = get_template_path()
 
 # ==================== 模板文件二进制缓存 ====================
-# 启动时一次性读入内存，fill_template 时直接从 BytesIO 加载，无需每次读磁盘
 TEMPLATE_BYTES: bytes | None = None
 
 
@@ -111,7 +112,7 @@ CP_HEADER_ROW = 8
 CP_OP_COLS = [1, 2, 3]   # A/B/C 列识别 OP/工序
 CP_DATA_COLS = [4, 5, 7, 8, 9, 10, 11]  # D, E, G, H, I, J, K
 
-# 去重时使用的固定 key 列顺序（避免 sorted() 开销）
+# 去重时使用的固定 key 列顺序
 DATA_KEY_COLS = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
 
 # ==================== Flask 配置 ====================
@@ -125,7 +126,6 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ==================== 服务端 CP 解析缓存 ====================
-# 避免 upload / reparse / generate 时重复 load_workbook
 cp_cache: dict[str, dict] = {}
 
 
@@ -145,6 +145,54 @@ def cleanup_old_files(directory: str, max_age_hours: int = 24):
                     pass
     except FileNotFoundError:
         pass
+
+
+# ==================== 合并单元格感知读取 ====================
+def build_merged_aware_rows(ws, min_row: int, max_row: int, max_col: int) -> list:
+    """
+    读取工作表数据，并自动展开合并单元格。
+    
+    openpyxl 的 iter_rows(values_only=True) 对合并单元格只返回左上角一个值，
+    其它位置返回 None。此函数通过 ws.merged_cells.ranges 获取合并区域，
+    将左上角单元格的值填充到合并区域内所有单元格。
+    
+    返回：
+        rows: list[list[Any]]，与 values_only=True 格式一致，但合并单元格已展开
+    """
+    # values_only=False 获取 Cell 对象，否则拿不到合并信息的位置对应关系
+    cell_rows = list(ws.iter_rows(
+        min_row=min_row,
+        max_row=max_row,
+        min_col=1,
+        max_col=max_col,
+        values_only=False,
+    ))
+    
+    # 构建基础值矩阵
+    rows = [[cell.value for cell in row] for row in cell_rows]
+    
+    # 展开合并单元格
+    for merged_range in ws.merged_cells.ranges:
+        mr_min_row = merged_range.min_row
+        mr_max_row = merged_range.max_row
+        mr_min_col = merged_range.min_col
+        mr_max_col = merged_range.max_col
+        
+        # 只处理在读取范围内的合并区域
+        if mr_max_row < min_row or mr_min_row > max_row:
+            continue
+        if mr_min_col > max_col:
+            continue
+        
+        # 左上角值
+        top_left_value = rows[mr_min_row - 1][mr_min_col - 1]
+        
+        # 填充整个合并区域
+        for r in range(max(min_row, mr_min_row), min(max_row, mr_max_row) + 1):
+            for c in range(mr_min_col, min(mr_max_col, max_col) + 1):
+                rows[r - 1][c - 1] = top_left_value
+    
+    return rows
 
 
 # ==================== 核心函数 ====================
@@ -167,8 +215,7 @@ def clean_text(val):
 
 def extract_cp_header_values_from_rows(rows: list, header_row: int) -> dict:
     """
-    从 rows（iter_rows 批量读取的结果）中提取 CP 表头信息。
-    rows 是 list of tuples，索引 = row_number - 1。
+    从 rows 中提取 CP 表头信息。
     """
     values = {
         'project': '', 'oem': '', 'part_no_oem': '',
@@ -196,13 +243,11 @@ def extract_cp_header_values_from_rows(rows: list, header_row: int) -> dict:
                 if values[field]:
                     continue
                 if any(kw.lower() in text.lower() for kw in kws):
-                    # 优先取右侧相邻单元格
                     if col_idx + 1 < max_col:
                         next_val = row[col_idx + 1]
                         if next_val is not None and str(next_val).strip():
                             values[field] = str(next_val).strip()
 
-    # 缺省值处理
     if not values['project'] and values['part_name']:
         values['project'] = values['part_name']
     if not values['part_desc'] and values['part_name']:
@@ -212,28 +257,23 @@ def extract_cp_header_values_from_rows(rows: list, header_row: int) -> dict:
 
 def parse_control_plan(filepath: str) -> dict:
     """
-    解析控制计划 —— 优化版。
-    使用 iter_rows + values_only 批量读取，比逐单元格访问快 5-10 倍。
-    - 读取 "control plan" sheet
-    - 第 8 行为表头
-    - A/B/C 列识别 OP，向下填充
-    - 仅保留 E 列（第5列）有内容的行
+    解析控制计划 —— 合并单元格感知版。
     """
     wb = openpyxl.load_workbook(filepath, data_only=True)
     ws = wb[find_control_plan_sheet(wb)]
 
-    # 只读需要的列（到第 11 列 K 即可），values_only=True 直接返回值
     max_data_col = max(CP_DATA_COLS)  # 11
-    rows = list(ws.iter_rows(
+
+    # 使用合并感知读取，自动展开 A~K 列的合并单元格
+    rows = build_merged_aware_rows(
+        ws,
         min_row=1,
         max_row=ws.max_row,
-        min_col=1,
         max_col=max_data_col,
-        values_only=True,
-    ))
+    )
     wb.close()
 
-    # 读取第8行表头（索引 = 7）
+    # 读取第8行表头
     all_headers = {}
     if len(rows) >= CP_HEADER_ROW:
         header_row = rows[CP_HEADER_ROW - 1]
@@ -250,14 +290,12 @@ def parse_control_plan(filepath: str) -> dict:
     workstations = []
     op_set = set()
 
-    # 从 CP_HEADER_ROW + 1 开始（索引 = CP_HEADER_ROW）
     for row_idx in range(CP_HEADER_ROW, len(rows)):
         row = rows[row_idx]
-        a_val = row[0]  # A 列
-        b_val = row[1]  # B 列
-        c_val = row[2]  # C 列
+        a_val = row[0]
+        b_val = row[1]
+        c_val = row[2]
 
-        # 更新最近见过的 OP 值
         if a_val is not None and str(a_val).strip():
             last_op['A'] = clean_text(a_val)
         if b_val is not None and str(b_val).strip():
@@ -265,31 +303,33 @@ def parse_control_plan(filepath: str) -> dict:
         if c_val is not None and str(c_val).strip():
             last_op['C'] = clean_text(c_val)
 
-        # 判断是否是新 OP 开始
-        new_marker = a_val is not None and str(a_val).strip()
-        if new_marker or (b_val is not None and str(b_val).strip()) or (c_val is not None and str(c_val).strip()):
+        # 新 OP 开始
+        if (a_val is not None and str(a_val).strip()) or \
+           (b_val is not None and str(b_val).strip()) or \
+           (c_val is not None and str(c_val).strip()):
             op_key = last_op['A'] or last_op['B'] or last_op['C']
-            if op_key and op_key not in op_set:
-                op_set.add(op_key)
-                workstations.append(op_key)
-                current_op = op_key
-            elif op_key:
-                current_op = op_key
+            if op_key:
+                if op_key not in op_set:
+                    op_set.add(op_key)
+                    workstations.append(op_key)
+                    current_op = op_key
+                else:
+                    current_op = op_key
 
-        # E 列（索引 4）有内容才保留
-        e_val = row[4]  # row[0]=A, row[1]=B, row[2]=C, row[3]=D, row[4]=E
+        # E 列有内容才保留
+        e_val = row[4]
         if e_val is not None and str(e_val).strip():
             row_data = {
                 1: last_op['A'],
                 2: last_op['B'],
                 3: last_op['C'],
-                4: row[3],   # D
-                5: row[4],   # E
-                7: row[6],   # G
-                8: row[7],   # H
-                9: row[8],   # I
-                10: row[9],  # J
-                11: row[10], # K
+                4: row[3],    # D
+                5: row[4],    # E
+                7: row[6],    # G
+                8: row[7],    # H
+                9: row[8],    # I
+                10: row[9],   # J
+                11: row[10],  # K
             }
             all_data.append(row_data)
 
@@ -307,7 +347,6 @@ def parse_control_plan(filepath: str) -> dict:
 def unmerge_target_area(ws, start_row: int, end_row: int):
     """
     一次性解除指定行范围内的所有合并单元格。
-    使用 openpyxl 对象的 min_row/max_row 属性，避免正则。
     """
     to_unmerge = []
     for merged_range in ws.merged_cells.ranges:
@@ -319,9 +358,7 @@ def unmerge_target_area(ws, start_row: int, end_row: int):
 
 def fill_template(cp_data: dict, selected_ws: str, header_values: dict) -> BytesIO:
     """
-    填充 T.Q.M.013 模板 —— 优化版。
-    - 从 TEMPLATE_BYTES 缓存加载，避免每次读磁盘
-    - 一次性解除所有合并单元格后直接写入，无需 safe_write_cell
+    填充 T.Q.M.013 模板。
     """
     if TEMPLATE_BYTES is None:
         raise FileNotFoundError("未找到 T.Q.M.013 模板文件！")
@@ -329,11 +366,10 @@ def fill_template(cp_data: dict, selected_ws: str, header_values: dict) -> Bytes
     wb = openpyxl.load_workbook(BytesIO(TEMPLATE_BYTES), keep_vba=True)
     ws = wb.active
 
-    # ====== 一次性解除所有目标区域的合并单元格 ======
-    # 表头区（行 1~18）和内容区（行 19~48）全部解除
+    # 一次性解除表头和内容区的合并单元格
     unmerge_target_area(ws, 1, CONTENT_END_ROW)
 
-    # ====== 填充表头（直接写入，无需 safe 检查） ======
+    # 填充表头
     for field, config in TQM013_HEADER_FIELDS.items():
         if field == 'release_date':
             value = header_values.get('release_date') or datetime.now().strftime('%Y-%m-%d')
@@ -344,11 +380,11 @@ def fill_template(cp_data: dict, selected_ws: str, header_values: dict) -> Bytes
         if value:
             ws.cell(row=config['row'], column=config['col'], value=value)
 
-    # ====== 按选定的 OP 筛选数据行 ======
+    # 按选定的 OP 筛选数据行
     ws_col = cp_data['workstation_col']
     matched = [row for row in cp_data['data'] if row.get(ws_col) == selected_ws]
 
-    # 去重（固定 key 顺序，避免 sorted() 和 str() 开销）
+    # 去重
     seen = set()
     unique_matched = []
     for row in matched:
@@ -357,7 +393,7 @@ def fill_template(cp_data: dict, selected_ws: str, header_values: dict) -> Bytes
             seen.add(key)
             unique_matched.append(row)
 
-    # ====== 填充内容数据（直接写入） ======
+    # 填充内容数据
     current_row = CONTENT_START_ROW
     for row_data in unique_matched:
         if current_row > CONTENT_END_ROW:
@@ -407,8 +443,6 @@ def upload_control_plan():
 
     try:
         cp_data = parse_control_plan(filepath)
-
-        # 缓存到服务端字典，避免后续 generate 时重复解析
         cp_cache[session_id] = cp_data
 
         session['cp_filepath'] = filepath
@@ -439,7 +473,6 @@ def reparse_with_column():
 
     try:
         cp_data = parse_control_plan(cp_filepath)
-        # 更新缓存
         if session_id:
             cp_cache[session_id] = cp_data
 
@@ -465,11 +498,9 @@ def generate():
     if not session_id_from_body or not workstation:
         return jsonify({'success': False, 'error': '缺少必要参数'})
 
-    # 优先从服务端缓存获取 cp_data，避免重复解析
     cp_data = cp_cache.get(session_id_from_body)
 
     if cp_data is None:
-        # 缓存未命中，回退到重新解析
         cp_filepath = session.get('cp_filepath')
         if not cp_filepath or not os.path.exists(cp_filepath):
             return jsonify({'success': False, 'error': '会话已过期，请重新上传文件'})
@@ -512,10 +543,8 @@ def download(filename):
 @app.route('/api/cleanup', methods=['POST'])
 def cleanup():
     sid = session.get('cp_session_id')
-    # 清理缓存
     if sid and sid in cp_cache:
         del cp_cache[sid]
-    # 清理文件
     if sid:
         for d in [UPLOAD_DIR, OUTPUT_DIR]:
             try:
@@ -527,13 +556,13 @@ def cleanup():
     return jsonify({'success': True})
 
 
-# ==================== 内嵌 HTML（前端防抖优化） ====================
+# ==================== 内嵌 HTML（略，与 v5.0 一致）====================
 HTML_PAGE = r'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>T.QM.013 检验指导书生成器 v5.0</title>
+<title>T.QM.013 检验指导书生成器 v5.1</title>
 <style>
 :root { --primary: #2563eb; --primary-hover: #1d4ed8; --bg: #f1f5f9; --card-bg: #ffffff; --border: #e2e8f0; --text: #1e293b; --text-secondary: #64748b; --success: #16a34a; --warning: #ea580c; --danger: #dc2626; --radius: 8px; --shadow: 0 1px 3px rgba(0,0,0,0.08); }
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -617,7 +646,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
 </head>
 <body>
 <div class="header">
-    <h1>📋 T.QM.013 检验指导书生成器 v5.0</h1>
+    <h1>📋 T.QM.013 检验指导书生成器 v5.1</h1>
     <span class="status" id="statusBar">检查模板...</span>
 </div>
 <div class="main-layout">
@@ -632,7 +661,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
         <div class="card" id="step1Card">
             <h2>📁 步骤 1：上传版本控制计划</h2>
             <div class="upload-zone" id="uploadZone">
-                <div class="upload-icon">📤</div>
+                <div class="upload-icon"></div>
                 <p>拖拽 Excel 文件，或 <span class="browse-link" id="browseLink">点击浏览</span></p>
                 <p style="font-size:0.7rem;margin-top:3px;">支持 .xlsx / .xlsm / .xls</p>
                 <input type="file" id="fileInput" accept=".xlsx,.xlsm,.xls">
@@ -692,7 +721,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
             </div>
             <div class="btn-group" style="justify-content:space-between;">
                 <button class="btn btn-outline btn-sm" id="btnBackToStep2">← 返回</button>
-                <button class="btn btn-primary" id="btnGenerate">🚀 生成检验指导书 <span class="spinner" id="generateSpinner"></span></button>
+                <button class="btn btn-primary" id="btnGenerate"> 生成检验指导书 <span class="spinner" id="generateSpinner"></span></button>
             </div>
         </div>
         <div class="card hidden" id="step4Card">
@@ -703,7 +732,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
                 <p id="resultFilename" style="font-size:0.85rem;"></p>
             </div>
             <div class="btn-group" style="justify-content:center;">
-                <button class="btn btn-success" id="btnDownload">📥 下载</button>
+                <button class="btn btn-success" id="btnDownload"> 下载</button>
                 <button class="btn btn-outline btn-sm" onclick="resetAll()">🔄 新建</button>
             </div>
         </div>
@@ -843,7 +872,7 @@ $('#btnGenerate').addEventListener('click',async()=>{
 
 $('#btnDownload').addEventListener('click',()=>{if(STATE.downloadUrl)window.open(STATE.downloadUrl,'_blank');});
 
-// ====== 防抖版 updatePreview ======
+// 防抖版 updatePreview
 let _previewTimer=null;
 function updatePreview(){
     clearTimeout(_previewTimer);
@@ -901,7 +930,6 @@ def find_free_port():
 
 
 def main():
-    # 启动时初始化缓存
     template_ok = init_template_cache()
     cleanup_old_files(UPLOAD_DIR)
     cleanup_old_files(OUTPUT_DIR)
@@ -909,10 +937,10 @@ def main():
     port = find_free_port()
     url = f'http://127.0.0.1:{port}'
     print("=" * 55)
-    print("  T.QM.013 检验指导书生成器 v5.0 (优化版)")
+    print("  T.QM.013 检验指导书生成器 v5.1 (合并单元格感知 + 优化版)")
     print("=" * 55)
     print(f"  模板文件: {TEMPLATE_FILE or '❌ 未找到!'}")
-    print(f"  模板缓存: {'✅ 已缓存' if template_ok else '❌ 未缓存'}")
+    print(f"  模板缓存: {'✅ 已缓存' if template_ok else ' 未缓存'}")
     print(f"  本地地址: {url}")
     print("=" * 55)
 
