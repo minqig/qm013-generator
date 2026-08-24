@@ -1,9 +1,10 @@
 """
-T.QM.013 检验指导书生成器 v3.0
-基于实际模板单元格坐标精确填充
+T.QM.013 检验指导书生成器 v3.1
+修复：指定读取 "control plan" sheet，从第8行开始截取表头
 """
 import os
 import sys
+import re
 import socket
 import threading
 import webbrowser
@@ -57,45 +58,38 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ==================== T.QM.013 模板精确单元格映射 ====================
-# 格式: (row, col) — 基于实际模板坐标
-
 TQM013_HEADER_FIELDS = {
-    # 表头基本信息区
-    'project':        {'row': 3,  'col': 8,  'label': '项目'},           # H3
-    'oem':            {'row': 6,  'col': 5,  'label': 'OEM/客户'},        # E6
-    'part_no_oem':    {'row': 6,  'col': 8,  'label': '客户零件号'},      # H6
-    'part_name':      {'row': 8,  'col': 5,  'label': '零件名称'},        # E8
-    'part_desc':      {'row': 10, 'col': 6,  'label': '零件描述'},        # F10
-    'release_date':   {'row': 12, 'col': 5,  'label': '发布日期'},        # E12
-    'workstation':    {'row': 12, 'col': 11, 'label': '工作站'},          # K12
+    'project':        {'row': 3,  'col': 8,  'label': '项目 (H3)'},
+    'oem':            {'row': 6,  'col': 5,  'label': '客户/OEM (E6)'},
+    'part_no_oem':    {'row': 6,  'col': 8,  'label': '客户零件号 (H6)'},
+    'part_name':      {'row': 8,  'col': 5,  'label': '零件名称 (E8)'},
+    'part_desc':      {'row': 10, 'col': 6,  'label': '零件描述 (F10)'},
+    'release_date':   {'row': 12, 'col': 5,  'label': '发布日期 (E12)'},
+    'workstation':    {'row': 12, 'col': 11, 'label': '工作站 (K12)'},
 }
 
-# 内容数据区：从第19行开始
 CONTENT_START_ROW = 19
 CONTENT_END_ROW = 48
 
 TQM013_CONTENT_COLS = {
-    'content_number':      {'col': 3,  'label': '编号'},                  # C19-C48
-    'special_char':        {'col': 5,  'label': '特殊特性符号'},           # E19-E48
-    'char_desc':           {'col': 6,  'label': '特性描述'},               # F19-F48
-    'equipment_freq':      {'col': 13, 'label': '设备和测频次'},           # M19-M48
-    'responsible':         {'col': 15, 'label': '负责人'},                 # O19-O48
+    'content_number':      {'col': 3,  'label': '编号 (C19↓)'},
+    'special_char':        {'col': 5,  'label': '特殊特性符号 (E19↓)'},
+    'char_desc':           {'col': 6,  'label': '特性描述 (F19↓)'},
+    'equipment_freq':      {'col': 13, 'label': '设备和测频次 (M19↓)'},
+    'responsible':         {'col': 15, 'label': '负责人 (O19↓)'},
 }
 
-# 表头字段的自动匹配关键词（CP列名 → T.QM.013 表头字段）
 HEADER_MATCH_RULES = {
     'project':        ['项目', 'project', 'projekt', '项目名称', '项目号', '产品项目'],
     'oem':            ['oem', '客户', 'customer', 'kunde', '顾客', '客户名称'],
     'part_no_oem':    ['零件号', 'part no', 'part number', 'teilnummer', 'oem零件号', '客户零件号', '图号', '图纸号', 'drawing no', 'drawing'],
-    'part_name':      ['零件名称', 'part name', '产品名称', 'product name', '名称', '部件名称', '零件描述'],
-    'part_desc':      ['零件描述', 'part description', '单个零件', '描述', '产品描述', '说明'],
-    'release_date':   ['发布日期', 'release date', '版本日期', '生效日期', 'date', '编制日期'],
+    'part_name':      ['零件名称', 'part name', '产品名称', 'product name', '名称', '部件名称'],
+    'part_desc':      ['零件描述', 'part description', '单个零件', '产品描述', '说明'],
     'workstation':    ['工位', 'op', '工作站', 'station', 'arbeitsplatz', '工序', 'process', '岗位', 'operation', 'station nr'],
 }
 
-# 内容列的自动匹配关键词
 CONTENT_MATCH_RULES = {
-    'content_number': ['编号', '序号', 'nr', 'no', 'number', '步骤', 'step', 'item', '内容'],
+    'content_number': ['编号', '序号', 'nr', 'no', 'number', '步骤', 'step', 'item'],
     'special_char':   ['特殊特性', '特性符号', '符号', 'special', '关键特性', '重要特性', 'sc', 'cc', '分类'],
     'char_desc':      ['特性描述', '描述', 'description', 'beschreibung', '要求', 'requirement', '说明', '特征', '检查项目', '检验项目', '规格'],
     'equipment_freq': ['设备', '试验', 'test', 'equipment', 'prüf', 'messmittel', '检测', '测量', '量具', '检具', '仪器', '工具', '频次', '频率', 'frequency'],
@@ -103,31 +97,51 @@ CONTENT_MATCH_RULES = {
 }
 
 
-# ==================== 核心解析函数 ====================
+# ==================== 核心函数 ====================
+
+def find_control_plan_sheet(wb):
+    """
+    在工作簿中查找 "control plan" sheet（不区分大小写）
+    支持: "control plan", "Control Plan", "CONTROL PLAN", "CP" 等
+    """
+    target_names = ['control plan', 'cp', 'controlplan', 'kontrollplan', 'steuerplan']
+    for sheet_name in wb.sheetnames:
+        name_lower = sheet_name.lower().strip()
+        for target in target_names:
+            if target in name_lower:
+                return sheet_name
+    # 如果找不到，返回第一个 sheet（回退方案）
+    return wb.sheetnames[0]
+
 
 def parse_control_plan(filepath, user_ws_col=None):
-    """解析控制计划 Excel"""
+    """
+    解析控制计划 Excel
+    ★ 修复：指定读取 "control plan" sheet，从第8行开始截取表头
+    """
     wb = openpyxl.load_workbook(filepath, data_only=True)
-    ws = wb.active
 
-    # 自动检测表头行
-    header_row = 1
-    max_cells = 0
-    for row_idx in range(1, min(31, ws.max_row or 100)):
-        non_empty = 0
-        for col_idx in range(1, (ws.max_column or 1) + 1):
-            if ws.cell(row=row_idx, column=col_idx).value is not None:
-                non_empty += 1
-        if non_empty > max_cells:
-            max_cells = non_empty
-            header_row = row_idx
+    # ★ 1. 查找 "control plan" sheet
+    sheet_name = find_control_plan_sheet(wb)
+    ws = wb[sheet_name]
+    print(f"[解析] 使用 Sheet: '{sheet_name}'")
 
+    # ★ 2. 固定表头行为第8行
+    header_row = 8
+    print(f"[解析] 表头行: 第 {header_row} 行")
+
+    # ★ 3. 解析表头（第8行所有列）
     all_headers = {}
     for col_idx in range(1, (ws.max_column or 1) + 1):
         cell = ws.cell(row=header_row, column=col_idx)
         all_headers[col_idx] = str(cell.value).strip() if cell.value else ''
 
-    # 自动检测工位列
+    print(f"[解析] 表头列数: {len(all_headers)}")
+    # 打印前10列表头用于调试
+    header_preview = {k: all_headers[k] for k in list(all_headers.keys())[:10]}
+    print(f"[解析] 表头预览: {header_preview}")
+
+    # ★ 4. 自动检测工位列（在第8行表头中搜索）
     workstation_col = None
     ws_keywords = [
         '工位', 'op', '工作站', 'station', 'arbeitsplatz',
@@ -141,9 +155,13 @@ def parse_control_plan(filepath, user_ws_col=None):
             header_lower = header.lower()
             if any(kw in header_lower for kw in ws_keywords):
                 workstation_col = col_idx
+                print(f"[解析] 自动识别工位列: 列{col_idx} '{header}'")
                 break
 
-    # 解析数据行
+    if workstation_col is None:
+        print("[解析] ⚠️ 未自动识别到工位列")
+
+    # ★ 5. 解析数据行（从第9行开始，因为第8行是表头）
     all_data = []
     workstations = []
     for row_idx in range(header_row + 1, (ws.max_row or header_row + 1) + 1):
@@ -161,6 +179,9 @@ def parse_control_plan(filepath, user_ws_col=None):
                 if ws_name and ws_name not in workstations:
                     workstations.append(ws_name)
 
+    print(f"[解析] 数据行数: {len(all_data)}, 工位数: {len(workstations)}")
+    print(f"[解析] 工位列表: {workstations}")
+
     wb.close()
     return {
         'headers': all_headers,
@@ -169,11 +190,11 @@ def parse_control_plan(filepath, user_ws_col=None):
         'data': all_data,
         'header_row': header_row,
         'total_columns': (ws.max_column or 1),
+        'sheet_name': sheet_name,
     }
 
 
 def auto_match_headers(cp_headers):
-    """自动匹配 CP 表头 → T.QM.013 表头字段"""
     mapping = {}
     used = set()
     for field, keywords in HEADER_MATCH_RULES.items():
@@ -189,7 +210,6 @@ def auto_match_headers(cp_headers):
 
 
 def auto_match_content(cp_headers):
-    """自动匹配 CP 表头 → T.QM.013 内容列"""
     mapping = {}
     used = set()
     for field, keywords in CONTENT_MATCH_RULES.items():
@@ -204,6 +224,37 @@ def auto_match_content(cp_headers):
     return mapping
 
 
+def safe_write_cell(ws, row, col, value):
+    """安全写入单元格：自动处理合并单元格"""
+    cell_coord = ws.cell(row=row, column=col).coordinate
+    to_unmerge = []
+    for merged_range in ws.merged_cells.ranges:
+        if cell_coord in merged_range:
+            to_unmerge.append(str(merged_range))
+    for rng in to_unmerge:
+        ws.unmerge_cells(rng)
+    ws.cell(row=row, column=col, value=value)
+
+
+def unmerge_content_area(ws):
+    """解除内容数据区（第19-48行）的所有合并单元格"""
+    to_unmerge = []
+    for merged_range in ws.merged_cells.ranges:
+        mr = str(merged_range)
+        try:
+            rows_match = re.findall(r'(\d+)', mr)
+            if rows_match:
+                rows = [int(r) for r in rows_match]
+                min_row = min(rows)
+                max_row = max(rows)
+                if min_row >= CONTENT_START_ROW and max_row <= CONTENT_END_ROW:
+                    to_unmerge.append(mr)
+        except Exception:
+            pass
+    for rng in to_unmerge:
+        ws.unmerge_cells(rng)
+
+
 def fill_template(cp_data, selected_ws, header_mapping, content_mapping):
     """基于 T.QM.013 模板精确填充数据"""
     if TEMPLATE_FILE is None:
@@ -212,36 +263,35 @@ def fill_template(cp_data, selected_ws, header_mapping, content_mapping):
     wb = openpyxl.load_workbook(TEMPLATE_FILE, keep_vba=True)
     ws = wb.active
 
-    # ===== 1. 填充表头基本信息 =====
-    # 先尝试从 CP 数据的第一行提取信息
+    # 0. 预处理：解除内容数据区的合并单元格
+    unmerge_content_area(ws)
+
+    # 1. 从 CP 数据提取第一行
     first_row = {}
     if cp_data['data']:
         first_row = cp_data['data'][0]
 
+    # 2. 填充表头基本信息
     for field, config in TQM013_HEADER_FIELDS.items():
         value = None
         cp_col = header_mapping.get(field)
 
         if field == 'release_date':
-            # 发布日期：自动填充当天日期
             value = datetime.now().strftime('%Y-%m-%d')
         elif field == 'workstation':
-            # 工作站：填充用户选择的工位
             value = selected_ws
-        elif cp_col and cp_col in first_row:
-            # 从 CP 第一行提取
+        elif cp_col and cp_col in first_row and first_row[cp_col] is not None:
             value = first_row[cp_col]
         elif cp_col and cp_data['data']:
-            # 从 CP 所有行中搜索第一个非空值
             for row_data in cp_data['data']:
                 if cp_col in row_data and row_data[cp_col] is not None:
                     value = row_data[cp_col]
                     break
 
-        if value is not None:
-            ws.cell(row=config['row'], column=config['col'], value=value)
+        if value is not None and str(value).strip() != '':
+            safe_write_cell(ws, config['row'], config['col'], value)
 
-    # ===== 2. 筛选匹配工位的数据行 =====
+    # 3. 筛选匹配工位的数据行
     ws_col = cp_data['workstation_col']
     matched = []
     for row_data in cp_data['data']:
@@ -252,7 +302,6 @@ def fill_template(cp_data, selected_ws, header_mapping, content_mapping):
             elif str(selected_ws).strip().lower() in cell_val.lower():
                 matched.append(row_data)
 
-    # 去重
     seen = set()
     unique_matched = []
     for row in matched:
@@ -261,7 +310,7 @@ def fill_template(cp_data, selected_ws, header_mapping, content_mapping):
             seen.add(key)
             unique_matched.append(row)
 
-    # ===== 3. 填充内容数据（从第19行开始） =====
+    # 4. 填充内容数据（从第19行开始）
     current_row = CONTENT_START_ROW
     for row_data in unique_matched:
         if current_row > CONTENT_END_ROW:
@@ -270,8 +319,8 @@ def fill_template(cp_data, selected_ws, header_mapping, content_mapping):
             if field in TQM013_CONTENT_COLS:
                 col = TQM013_CONTENT_COLS[field]['col']
                 value = row_data.get(cp_col)
-                if value is not None:
-                    ws.cell(row=current_row, column=col, value=value)
+                if value is not None and str(value).strip() != '':
+                    safe_write_cell(ws, current_row, col, value)
         current_row += 1
 
     output = BytesIO()
@@ -326,6 +375,7 @@ def upload_control_plan():
             'session_id': session_id,
             'header_row': cp_data['header_row'],
             'total_columns': cp_data['total_columns'],
+            'sheet_name': cp_data.get('sheet_name', ''),
             'header_match': {k: v for k, v in header_match.items()},
             'content_match': {k: v for k, v in content_match.items()},
         })
@@ -354,6 +404,7 @@ def reparse_with_column():
             'headers': {str(k): v for k, v in cp_data['headers'].items()},
             'total_rows': len(cp_data['data']),
             'workstation_column': cp_data['workstation_col'],
+            'sheet_name': cp_data.get('sheet_name', ''),
             'header_match': {k: v for k, v in header_match.items()},
             'content_match': {k: v for k, v in content_match.items()},
         })
@@ -432,7 +483,7 @@ HTML_PAGE = r'''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>T.QM.013 检验指导书生成器 v3.0</title>
+<title>T.QM.013 检验指导书生成器 v3.1</title>
 <style>
 :root { --primary: #2563eb; --primary-hover: #1d4ed8; --bg: #f1f5f9; --card-bg: #ffffff; --border: #e2e8f0; --text: #1e293b; --text-secondary: #64748b; --success: #16a34a; --warning: #ea580c; --danger: #dc2626; --radius: 8px; --shadow: 0 1px 3px rgba(0,0,0,0.08); }
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -484,7 +535,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
 
 .map-section { margin-bottom: 10px; }
 .map-row { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font-size: 0.8rem; }
-.map-row label { min-width: 100px; font-weight: 500; text-align: right; }
+.map-row label { min-width: 120px; font-weight: 500; text-align: right; }
 .map-row select { flex: 1; padding: 4px 8px; border: 1.5px solid var(--border); border-radius: 4px; font-size: 0.78rem; }
 .map-row .match-badge { font-size: 0.65rem; padding: 2px 6px; border-radius: 10px; min-width: 44px; text-align: center; }
 .match-auto { background: #dcfce7; color: #166534; }
@@ -504,9 +555,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
 .column-selector select { padding: 6px 10px; border: 1.5px solid var(--border); border-radius: 6px; font-size: 0.82rem; }
 
 .preview-title { font-size: 0.95rem; font-weight: 600; margin-bottom: 10px; }
-.preview-hint { font-size: 0.7rem; color: var(--text-secondary); font-weight: 400; }
-.preview-table { width: 100%; border-collapse: collapse; font-size: 0.65rem; background: white; }
-.preview-table td, .preview-table th { border: 1px solid #d1d5db; padding: 2px 3px; min-width: 20px; height: 16px; text-align: center; }
+.preview-table { width: 100%; border-collapse: collapse; font-size: 0.62rem; background: white; }
+.preview-table td, .preview-table th { border: 1px solid #d1d5db; padding: 1px 2px; min-width: 18px; height: 14px; text-align: center; }
 .preview-table .filled { background: #dbeafe; font-weight: 600; color: #1e40af; }
 .preview-table .will-fill { background: #fef3c7; border: 1.5px dashed #f59e0b; }
 .preview-table .empty { color: #cbd5e1; }
@@ -532,12 +582,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
 <body>
 
 <div class="header">
-    <h1>📋 T.QM.013 检验指导书生成器 v3.0</h1>
+    <h1>📋 T.QM.013 检验指导书生成器 v3.1</h1>
     <span class="status" id="statusBar">检查模板...</span>
 </div>
 
 <div class="main-layout">
-    <!-- 左侧：操作面板 -->
     <div class="left-panel">
         <div class="steps" id="stepIndicator">
             <div class="step active" data-step="1"><span class="step-num">1</span> 上传CP</div>
@@ -545,10 +594,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
             <div class="step" data-step="3"><span class="step-num">3</span> 映射</div>
             <div class="step" data-step="4"><span class="step-num">4</span> 下载</div>
         </div>
-
         <div id="globalAlert" class="hidden"></div>
 
-        <!-- Step 1 -->
         <div class="card" id="step1Card">
             <h2>📁 步骤 1：上传版本控制计划</h2>
             <div class="upload-zone" id="uploadZone">
@@ -561,11 +608,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
             <div class="btn-group" style="justify-content:flex-end;"><span class="spinner" id="uploadSpinner"></span></div>
         </div>
 
-        <!-- Step 2 -->
         <div class="card hidden" id="step2Card">
             <h2>🔍 步骤 2：选择目标工位/OP</h2>
             <div id="headerPreviewBox" class="hidden">
-                <p style="font-weight:600;font-size:0.8rem;">📊 检测到的表头（第 <span id="headerRowNum"></span> 行）</p>
+                <p style="font-weight:600;font-size:0.8rem;">📊 检测到的表头（Sheet: <span id="sheetName"></span>, 第 <span id="headerRowNum"></span> 行）</p>
                 <div style="font-size:0.7rem;max-height:100px;overflow-y:auto;background:#f8fafc;padding:6px;border-radius:4px;" id="headerPreview"></div>
             </div>
             <div id="manualColumnBox" class="hidden">
@@ -588,14 +634,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
             </div>
         </div>
 
-        <!-- Step 3 -->
         <div class="card hidden" id="step3Card">
             <h2>🔗 步骤 3：确认列映射</h2>
             <div class="tab-bar">
                 <button class="tab-btn active" data-tab="header">📋 基本信息</button>
                 <button class="tab-btn" data-tab="content">📝 内容列</button>
             </div>
-
             <div id="tabHeader" class="map-section">
                 <h3>CP 列 → T.QM.013 表头字段</h3>
                 <div id="headerMappingRows"></div>
@@ -604,14 +648,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
                 <h3>CP 列 → T.QM.013 内容区域 (第19行起)</h3>
                 <div id="contentMappingRows"></div>
             </div>
-
             <div class="btn-group" style="justify-content:space-between;">
                 <button class="btn btn-outline btn-sm" id="btnBackToStep2">← 返回</button>
                 <button class="btn btn-primary" id="btnGenerate">🚀 生成检验指导书 <span class="spinner" id="generateSpinner"></span></button>
             </div>
         </div>
 
-        <!-- Step 4 -->
         <div class="card hidden" id="step4Card">
             <h2>✅ 步骤 4：生成完成！</h2>
             <div class="result-box">
@@ -626,7 +668,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
         </div>
     </div>
 
-    <!-- 右侧：预览面板 -->
     <div class="right-panel">
         <div class="preview-title">📐 T.QM.013 模板预览</div>
         <div class="preview-legend">
@@ -663,7 +704,6 @@ fetch('/api/status').then(r=>r.json()).then(d=>{
     $('#statusBar').style.color=d.template_found?'#bbf7d0':'#fecaca';
 });
 
-// ===== 上传 =====
 const uploadZone=$('#uploadZone'),fileInput=$('#fileInput'),uploadSpinner=$('#uploadSpinner');
 $('#browseLink').addEventListener('click',()=>fileInput.click());
 uploadZone.addEventListener('click',e=>{if(e.target!==$('#browseLink'))fileInput.click();});
@@ -687,6 +727,7 @@ async function handleFile(file){
         $('#fileName').textContent=file.name;
         $('#fileStats').textContent='共 '+d.total_rows+' 行，'+d.workstations.length+' 个工位';
         $('#fileInfo').classList.add('show');
+        $('#sheetName').textContent=d.sheet_name||'?';
         showHeaderPreview(d.headers,d.header_row);
         if(!d.workstation_column||STATE.workstations.length===0){
             showAlert('未自动识别工位列，请手动选择','warning');
@@ -734,7 +775,6 @@ $('#btnReparse').addEventListener('click',async()=>{
     finally{sp.style.display='none';}
 });
 
-// ===== 工位选择 =====
 function renderWorkstations(f){
     f=(f||'').toLowerCase();
     const filtered=(STATE.workstations||[]).filter(w=>String(w).toLowerCase().includes(f));
@@ -752,40 +792,36 @@ function renderWorkstations(f){
 $('#wsSearch').addEventListener('input',e=>renderWorkstations(e.target.value));
 $('#btnNextToMapping').addEventListener('click',()=>{if(!STATE.selectedWorkstation)return;buildMappingUI();setStep(3);});
 
-// ===== 映射界面 =====
 function buildMappingUI(){
     const allHeaders=STATE.allCpHeaders;
     const opts=['<option value="">-- 不映射 --</option>'];
-    for(const [col,hdr] of Object.entries(allHeaders)){
-        opts.push('<option value="'+col+'">列 '+col+': '+(hdr||'(空)')+'</option>');
-    }
+    for(const [col,hdr] of Object.entries(allHeaders))opts.push('<option value="'+col+'">列 '+col+': '+(hdr||'(空)')+'</option>');
     const optsHtml=opts.join('');
 
-    const hdrLabels={
-        project:'项目 (H3)',oem:'OEM/客户 (E6)',part_no_oem:'客户零件号 (H6)',
-        part_name:'零件名称 (E8)',part_desc:'零件描述 (F10)',
-        release_date:'发布日期 (E12,自动)',workstation:'工作站 (K12,自动)'
-    };
+    const hdrFields=[
+        {f:'project',label:'项目 (H3)'},{f:'oem',label:'客户/OEM (E6)'},
+        {f:'part_no_oem',label:'客户零件号 (H6)'},{f:'part_name',label:'零件名称 (E8)'},
+        {f:'part_desc',label:'零件描述 (F10)'},{f:'release_date',label:'发布日期 (E12, 自动)',auto:true},
+        {f:'workstation',label:'工作站 (K12, 自动)',auto:true},
+    ];
     let hRows='';
-    for(const [f,label] of Object.entries(hdrLabels)){
-        const curVal=STATE.headerMapping[f]||'';
-        const isAuto=(f==='release_date'||f==='workstation');
-        const badge=isAuto?'<span class="match-badge match-auto">自动</span>':(curVal?'<span class="match-badge match-auto">✅</span>':'<span class="match-badge match-none">—</span>');
-        const disabled=isAuto?' disabled':'';
-        hRows+='<div class="map-row"><label>'+label+'</label><select data-field="'+f+'" data-type="header" class="map-select"'+disabled+'>'+optsHtml+'</select>'+badge+'</div>';
+    for(const item of hdrFields){
+        const curVal=STATE.headerMapping[item.f]||'';
+        const badge=item.auto?'<span class="match-badge match-auto">自动</span>':(curVal?'<span class="match-badge match-auto">✅</span>':'<span class="match-badge match-none">—</span>');
+        hRows+='<div class="map-row"><label>'+item.label+'</label><select data-field="'+item.f+'" data-type="header" class="map-select"'+(item.auto?' disabled':'')+'>'+optsHtml+'</select>'+badge+'</div>';
     }
     $('#headerMappingRows').innerHTML=hRows;
 
-    const cntLabels={
-        content_number:'编号 (C19↓)',special_char:'特殊特性符号 (E19↓)',
-        char_desc:'特性描述 (F19↓)',equipment_freq:'设备和测频次 (M19↓)',
-        responsible:'负责人 (O19↓)'
-    };
+    const cntFields=[
+        {f:'content_number',label:'编号 (C19↓)'},{f:'special_char',label:'特殊特性符号 (E19↓)'},
+        {f:'char_desc',label:'特性描述 (F19↓)'},{f:'equipment_freq',label:'设备和测频次 (M19↓)'},
+        {f:'responsible',label:'负责人 (O19↓)'},
+    ];
     let cRows='';
-    for(const [f,label] of Object.entries(cntLabels)){
-        const curVal=STATE.contentMapping[f]||'';
+    for(const item of cntFields){
+        const curVal=STATE.contentMapping[item.f]||'';
         const badge=curVal?'<span class="match-badge match-auto">✅</span>':'<span class="match-badge match-none">—</span>';
-        cRows+='<div class="map-row"><label>'+label+'</label><select data-field="'+f+'" data-type="content" class="map-select">'+optsHtml+'</select>'+badge+'</div>';
+        cRows+='<div class="map-row"><label>'+item.label+'</label><select data-field="'+item.f+'" data-type="content" class="map-select">'+optsHtml+'</select>'+badge+'</div>';
     }
     $('#contentMappingRows').innerHTML=cRows;
 
@@ -829,64 +865,26 @@ $('#btnGenerate').addEventListener('click',async()=>{
 });
 $('#btnDownload').addEventListener('click',()=>{if(STATE.downloadUrl)window.open(STATE.downloadUrl,'_blank');});
 
-// ===== 右侧预览 =====
 function updatePreview(){
     const hm=STATE.headerMapping||{},cm=STATE.contentMapping||{};
     const filled={};
-    for(const [f,cpCol] of Object.entries(hm)){
-        if(f==='release_date') filled[f]='(自动: 今天)';
-        else if(f==='workstation') filled[f]=STATE.selectedWorkstation||'(待选)';
+    for(const[f,cpCol]of Object.entries(hm)){
+        if(f==='release_date')filled[f]='(自动:今天)';
+        else if(f==='workstation')filled[f]=STATE.selectedWorkstation||'(待选)';
         else filled[f]='(已映射)';
     }
-    if(STATE.selectedWorkstation) filled['workstation']=STATE.selectedWorkstation;
-
+    if(STATE.selectedWorkstation)filled['workstation']=STATE.selectedWorkstation;
     let html='<table class="preview-table">';
     for(let row=1;row<=35;row++){
-        html+='<tr><td class="label-cell" style="font-size:0.55rem;">'+row+'</td>';
-        if(row===3){
-            html+='<td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td>';
-            html+='<td class="'+(filled['project']?'filled':'empty')+'">'+ (filled['project']||'H3')+'</td>';
-            html+='<td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td>';
-        }else if(row===6){
-            html+='<td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td>';
-            html+='<td class="'+(filled['oem']?'filled':'empty')+'">'+ (filled['oem']||'E6')+'</td>';
-            html+='<td class="empty"></td><td class="empty"></td>';
-            html+='<td class="'+(filled['part_no_oem']?'filled':'empty')+'">'+ (filled['part_no_oem']||'H6')+'</td>';
-            html+='<td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td>';
-        }else if(row===8){
-            html+='<td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td>';
-            html+='<td class="'+(filled['part_name']?'filled':'empty')+'">'+ (filled['part_name']||'E8')+'</td>';
-            for(let i=0;i<11;i++)html+='<td class="empty"></td>';
-        }else if(row===10){
-            html+='<td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td>';
-            html+='<td class="'+(filled['part_desc']?'filled':'empty')+'">'+ (filled['part_desc']||'F10')+'</td>';
-            for(let i=0;i<10;i++)html+='<td class="empty"></td>';
-        }else if(row===12){
-            html+='<td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td>';
-            html+='<td class="'+(filled['release_date']?'filled':'empty')+'">'+ (filled['release_date']||'E12')+'</td>';
-            html+='<td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td>';
-            html+='<td class="'+(filled['workstation']?'filled':'empty')+'">'+ (filled['workstation']||'K12')+'</td>';
-            for(let i=0;i<5;i++)html+='<td class="empty"></td>';
-        }else if(row===17){
-            html+='<td class="col-header">内容</td><td class="col-header">内容</td><td class="col-header">C</td><td class="col-header">D</td>';
-            for(let i=0;i<6;i++)html+='<td class="col-header">描述</td>';
-            html+='<td class="empty"></td><td class="col-header">试验等级/设备</td><td class="col-header">试验等级/设备</td><td class="col-header">负责人</td><td class="col-header">负责人</td>';
-        }else if(row>=19 && row<=30){
-            const hasContent=STATE.selectedWorkstation&&Object.keys(cm).length>0;
-            const cls=hasContent?'will-fill':'empty';
-            html+='<td class="empty"></td><td class="empty"></td>';
-            html+='<td class="'+cls+'">'+(cm['content_number']?'C'+row:'')+'</td>';
-            html+='<td class="empty"></td>';
-            html+='<td class="'+cls+'">'+(cm['special_char']?'E'+row:'')+'</td>';
-            html+='<td class="'+cls+'">'+(cm['char_desc']?'F'+row:'')+'</td>';
-            for(let i=0;i<6;i++)html+='<td class="empty"></td>';
-            html+='<td class="'+cls+'">'+(cm['equipment_freq']?'M'+row:'')+'</td>';
-            html+='<td class="empty"></td>';
-            html+='<td class="'+cls+'">'+(cm['responsible']?'O'+row:'')+'</td>';
-            html+='<td class="empty"></td>';
-        }else{
-            for(let c=0;c<16;c++)html+='<td class="empty"></td>';
-        }
+        html+='<tr><td class="label-cell" style="font-size:0.5rem;">'+row+'</td>';
+        if(row===3){for(let c=0;c<7;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['project']?'filled':'empty')+'">'+(filled['project']||'H3')+'</td>';for(let c=0;c<8;c++)html+='<td class="empty"></td>';}
+        else if(row===6){for(let c=0;c<4;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['oem']?'filled':'empty')+'">'+(filled['oem']||'E6')+'</td>';html+='<td class="empty"></td><td class="empty"></td>';html+='<td class="'+(filled['part_no_oem']?'filled':'empty')+'">'+(filled['part_no_oem']||'H6')+'</td>';for(let c=0;c<8;c++)html+='<td class="empty"></td>';}
+        else if(row===8){for(let c=0;c<4;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['part_name']?'filled':'empty')+'">'+(filled['part_name']||'E8')+'</td>';for(let c=0;c<11;c++)html+='<td class="empty"></td>';}
+        else if(row===10){for(let c=0;c<5;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['part_desc']?'filled':'empty')+'">'+(filled['part_desc']||'F10')+'</td>';for(let c=0;c<10;c++)html+='<td class="empty"></td>';}
+        else if(row===12){for(let c=0;c<4;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['release_date']?'filled':'empty')+'">'+(filled['release_date']||'E12')+'</td>';for(let c=0;c<5;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['workstation']?'filled':'empty')+'">'+(filled['workstation']||'K12')+'</td>';for(let c=0;c<5;c++)html+='<td class="empty"></td>';}
+        else if(row===17){html+='<td class="col-header">内容</td><td class="col-header">内容</td><td class="col-header">C</td><td class="col-header">D</td>';for(let i=0;i<6;i++)html+='<td class="col-header">描述</td>';html+='<td class="empty"></td><td class="col-header">试验等级/设备</td><td class="col-header">试验等级/设备</td><td class="col-header">负责人</td><td class="col-header">负责人</td>';}
+        else if(row>=19 && row<=30){const hasContent=STATE.selectedWorkstation&&Object.keys(cm).length>0;const cls=hasContent?'will-fill':'empty';html+='<td class="empty"></td><td class="empty"></td>';html+='<td class="'+cls+'">'+(cm['content_number']?'C'+row:'')+'</td>';html+='<td class="empty"></td>';html+='<td class="'+cls+'">'+(cm['special_char']?'E'+row:'')+'</td>';html+='<td class="'+cls+'">'+(cm['char_desc']?'F'+row:'')+'</td>';for(let i=0;i<6;i++)html+='<td class="empty"></td>';html+='<td class="'+cls+'">'+(cm['equipment_freq']?'M'+row:'')+'</td>';html+='<td class="empty"></td>';html+='<td class="'+cls+'">'+(cm['responsible']?'O'+row:'')+'</td>';html+='<td class="empty"></td>';}
+        else{for(let c=0;c<16;c++)html+='<td class="empty"></td>';}
         html+='</tr>';
     }
     html+='</table>';
@@ -923,7 +921,7 @@ def main():
     url = f'http://127.0.0.1:{port}'
 
     print("=" * 55)
-    print("  T.QM.013 检验指导书生成器 v3.0")
+    print("  T.QM.013 检验指导书生成器 v3.1")
     print("=" * 55)
     print(f"  模板文件: {TEMPLATE_FILE or '❌ 未找到!'}")
     print(f"  本地地址: {url}")
