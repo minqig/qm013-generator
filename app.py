@@ -1,19 +1,21 @@
 """
-T.QM.013 检验指导书生成器 v5.1（合并单元格感知 + 性能优化版）
+T.QM.013 检验指导书生成器 v5.2（最终优化版）
 根据 CP 模板结构自动按 OP 分组、固定列映射填充 T.QM.013
 
-新增功能：
+功能：
 - 合并单元格感知：自动拆解合并单元格，将左上角值填充到区域内所有单元格
 
-优化点：
+优化点（累计）：
 - iter_rows 批量读取，避免逐单元格访问
-- 服务端 CP 解析缓存，避免重复 load_workbook
+- 服务端 CP 解析缓存 + TTL 自动过期
 - 模板文件二进制缓存，启动时加载一次
 - unmerge 使用对象属性，避免正则
-- 一次性解除所有合并单元格后直接写入，无需 safe_write_cell
-- 去重固定 key 顺序
+- 一次性解除所有合并单元格后直接写入
+- 去重固定 key 顺序，筛选+去重合并为单次遍历
 - 启动时清理过期临时文件
-- 前端 updatePreview 防抖
+- 表头提取提前退出，OP 检测缓存 strip 结果
+- 合并单元格填充跳过 None
+- 前端事件委托 + 数组 join 构建 HTML + 防抖
 """
 import os
 import sys
@@ -63,7 +65,6 @@ TEMPLATE_BYTES: bytes | None = None
 
 
 def init_template_cache():
-    """启动时缓存模板文件二进制内容"""
     global TEMPLATE_BYTES
     if TEMPLATE_FILE and os.path.exists(TEMPLATE_FILE):
         with open(TEMPLATE_FILE, 'rb') as f:
@@ -74,45 +75,41 @@ def init_template_cache():
 
 # ==================== T.Q.M.013 模板目标坐标配置 ====================
 TQM013_HEADER_FIELDS = {
-    'project':      {'row': 3,  'col': 8,  'label': '项目'},        # H3
-    'oem':          {'row': 6,  'col': 5,  'label': '客户/OEM'},     # E6
-    'part_no_oem':  {'row': 10, 'col': 12, 'label': '零件号'},        # L10
-    'part_name':    {'row': 8,  'col': 5,  'label': '零件名称'},      # E8
-    'part_desc':    {'row': 10, 'col': 6,  'label': '零件描述'},     # F10
-    'release_date': {'row': 13, 'col': 8,  'label': '发布日期'},     # H13
-    'workstation':  {'row': 13, 'col': 11, 'label': '工作站'},       # K13
+    'project':      {'row': 3,  'col': 8,  'label': '项目'},
+    'oem':          {'row': 6,  'col': 5,  'label': '客户/OEM'},
+    'part_no_oem':  {'row': 10, 'col': 12, 'label': '零件号'},
+    'part_name':    {'row': 8,  'col': 5,  'label': '零件名称'},
+    'part_desc':    {'row': 10, 'col': 6,  'label': '零件描述'},
+    'release_date': {'row': 13, 'col': 8,  'label': '发布日期'},
+    'workstation':  {'row': 13, 'col': 11, 'label': '工作站'},
 }
 
 CONTENT_START_ROW = 19
 CONTENT_END_ROW = 48
 
 TQM013_CONTENT_COLS = {
-    'content_number': {'col': 3,  'label': '编号'},              # C
-    'special_char':   {'col': 5,  'label': '特殊特性符号'},      # E
-    'char_desc':      {'col': 6,  'label': '特性描述'},          # F
-    'spec_desc':      {'col': 8,  'label': '规格/描述补充'},    # H
-    'method_desc':    {'col': 12, 'label': '控制方法/备注'},    # L
-    'equipment_freq': {'col': 13, 'label': '设备/频次'},        # M
-    'responsible':    {'col': 15, 'label': '负责人'},           # O
+    'content_number': {'col': 3,  'label': '编号'},
+    'special_char':   {'col': 5,  'label': '特殊特性符号'},
+    'char_desc':      {'col': 6,  'label': '特性描述'},
+    'spec_desc':      {'col': 8,  'label': '规格/描述补充'},
+    'method_desc':    {'col': 12, 'label': '控制方法/备注'},
+    'equipment_freq': {'col': 13, 'label': '设备/频次'},
+    'responsible':    {'col': 15, 'label': '负责人'},
 }
 
-# CP 列 -> T.Q.M.013 内容列（固定写死）
 CP_TO_TQM_CONTENT = {
-    'content_number': 4,   # CP D -> TQM C
-    'special_char':   7,   # CP G -> TQM E
-    'char_desc':      5,   # CP E -> TQM F
-    'spec_desc':      8,   # CP H -> TQM H
-    'method_desc':    11,  # CP K -> TQM L
-    'equipment_freq': 9,   # CP I -> TQM M
-    'responsible':    10,  # CP J -> TQM O
+    'content_number': 4,
+    'special_char':   7,
+    'char_desc':      5,
+    'spec_desc':      8,
+    'method_desc':    11,
+    'equipment_freq': 9,
+    'responsible':    10,
 }
 
-# CP 模板结构
 CP_HEADER_ROW = 8
-CP_OP_COLS = [1, 2, 3]   # A/B/C 列识别 OP/工序
-CP_DATA_COLS = [4, 5, 7, 8, 9, 10, 11]  # D, E, G, H, I, J, K
-
-# 去重时使用的固定 key 列顺序
+CP_OP_COLS = [1, 2, 3]
+CP_DATA_COLS = [4, 5, 7, 8, 9, 10, 11]
 DATA_KEY_COLS = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
 
 # ==================== Flask 配置 ====================
@@ -125,13 +122,21 @@ OUTPUT_DIR = os.path.join(tempfile.gettempdir(), 'qm013_outputs')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ==================== 服务端 CP 解析缓存 ====================
-cp_cache: dict[str, dict] = {}
+# ==================== 服务端 CP 解析缓存（带 TTL） ====================
+cp_cache: dict[str, tuple[dict, float]] = {}  # session_id -> (cp_data, timestamp)
+CP_CACHE_TTL = 3600  # 1 小时
+
+
+def _clean_expired_cache():
+    """清理过期的 CP 缓存条目"""
+    now = time.time()
+    expired = [sid for sid, (_, ts) in cp_cache.items() if now - ts > CP_CACHE_TTL]
+    for sid in expired:
+        del cp_cache[sid]
 
 
 # ==================== 临时文件清理 ====================
 def cleanup_old_files(directory: str, max_age_hours: int = 24):
-    """清理超过指定时间的临时文件"""
     now = time.time()
     cutoff = now - max_age_hours * 3600
     try:
@@ -151,53 +156,47 @@ def cleanup_old_files(directory: str, max_age_hours: int = 24):
 def build_merged_aware_rows(ws, min_row: int, max_row: int, max_col: int) -> list:
     """
     读取工作表数据，并自动展开合并单元格。
-    
-    openpyxl 的 iter_rows(values_only=True) 对合并单元格只返回左上角一个值，
-    其它位置返回 None。此函数通过 ws.merged_cells.ranges 获取合并区域，
-    将左上角单元格的值填充到合并区域内所有单元格。
-    
-    返回：
-        rows: list[list[Any]]，与 values_only=True 格式一致，但合并单元格已展开
+    优化：左上角值为 None 时跳过填充，避免无效双循环。
     """
-    # values_only=False 获取 Cell 对象，否则拿不到合并信息的位置对应关系
     cell_rows = list(ws.iter_rows(
-        min_row=min_row,
-        max_row=max_row,
-        min_col=1,
-        max_col=max_col,
+        min_row=min_row, max_row=max_row,
+        min_col=1, max_col=max_col,
         values_only=False,
     ))
-    
-    # 构建基础值矩阵
     rows = [[cell.value for cell in row] for row in cell_rows]
-    
-    # 展开合并单元格
+
     for merged_range in ws.merged_cells.ranges:
         mr_min_row = merged_range.min_row
         mr_max_row = merged_range.max_row
         mr_min_col = merged_range.min_col
         mr_max_col = merged_range.max_col
-        
-        # 只处理在读取范围内的合并区域
+
         if mr_max_row < min_row or mr_min_row > max_row:
             continue
         if mr_min_col > max_col:
             continue
-        
-        # 左上角值
+
         top_left_value = rows[mr_min_row - 1][mr_min_col - 1]
-        
+
+        # 跳过 None：没必要填充 None
+        if top_left_value is None:
+            continue
+
         # 填充整个合并区域
-        for r in range(max(min_row, mr_min_row), min(max_row, mr_max_row) + 1):
-            for c in range(mr_min_col, min(mr_max_col, max_col) + 1):
-                rows[r - 1][c - 1] = top_left_value
-    
+        r_start = max(min_row, mr_min_row)
+        r_end = min(max_row, mr_max_row)
+        c_start = mr_min_col
+        c_end = min(mr_max_col, max_col)
+        for r in range(r_start, r_end + 1):
+            row = rows[r - 1]
+            for c in range(c_start, c_end + 1):
+                row[c - 1] = top_left_value
+
     return rows
 
 
 # ==================== 核心函数 ====================
 def find_control_plan_sheet(wb) -> str:
-    """查找 control plan sheet"""
     target_names = ['control plan', 'cp', 'controlplan', 'kontrollplan', 'steuerplan']
     for sheet_name in wb.sheetnames:
         name_lower = sheet_name.lower().strip()
@@ -215,38 +214,49 @@ def clean_text(val):
 
 def extract_cp_header_values_from_rows(rows: list, header_row: int) -> dict:
     """
-    从 rows 中提取 CP 表头信息。
+    提取 CP 表头信息。
+    优化：所有字段找到后立即 break 退出。
     """
     values = {
         'project': '', 'oem': '', 'part_no_oem': '',
         'part_name': '', 'part_desc': '', 'release_date': '',
     }
     keywords = {
-        'project': ['Project', '项目', 'Name / partdescription', 'partdescription', '零件描述'],
-        'oem': ['Final customer', 'Customer', '客户', 'Supplier / Production Location', 'Supplier'],
-        'part_no_oem': ['Assy-No', 'Part No', '零件号', 'GPIN', 'Assy-No / Latest change level'],
-        'part_name': ['Name / partdescription', 'partdescription', 'Part name', '零件名称', 'Name / part description'],
-        'part_desc': ['Name / partdescription', 'partdescription', 'Description', '描述'],
-        'release_date': ['revision list', 'Release', '发布日期'],
+        'project': ['project', '项目', 'name / partdescription', 'partdescription', '零件描述'],
+        'oem': ['final customer', 'customer', '客户', 'supplier / production location', 'supplier'],
+        'part_no_oem': ['assy-no', 'part no', '零件号', 'gpin', 'assy-no / latest change level'],
+        'part_name': ['name / partdescription', 'partdescription', 'part name', '零件名称', 'name / part description'],
+        'part_desc': ['name / partdescription', 'partdescription', 'description', '描述'],
+        'release_date': ['revision list', 'release', '发布日期'],
+    }
+    # 预编译：所有 keyword 转小写
+    keywords_lower = {
+        field: [kw.lower() for kw in kws]
+        for field, kws in keywords.items()
     }
 
     max_col = len(rows[0]) if rows else 0
 
-    for row_idx in range(header_row):  # 0 ~ header_row-1
+    for row_idx in range(header_row):
         row = rows[row_idx]
         for col_idx in range(max_col):
             val = row[col_idx]
             if val is None:
                 continue
-            text = str(val).strip()
-            for field, kws in keywords.items():
+            text = str(val).strip().lower()
+            for field, kws in keywords_lower.items():
                 if values[field]:
                     continue
-                if any(kw.lower() in text.lower() for kw in kws):
+                if any(kw in text for kw in kws):
                     if col_idx + 1 < max_col:
                         next_val = row[col_idx + 1]
                         if next_val is not None and str(next_val).strip():
                             values[field] = str(next_val).strip()
+            # 提前退出：所有字段都找到了
+            if all(values[f] for f in values):
+                break
+        if all(values[f] for f in values):
+            break
 
     if not values['project'] and values['part_name']:
         values['project'] = values['part_name']
@@ -256,80 +266,61 @@ def extract_cp_header_values_from_rows(rows: list, header_row: int) -> dict:
 
 
 def parse_control_plan(filepath: str) -> dict:
-    """
-    解析控制计划 —— 合并单元格感知版。
-    """
+    """解析控制计划 —— 合并单元格感知版。"""
     wb = openpyxl.load_workbook(filepath, data_only=True)
     ws = wb[find_control_plan_sheet(wb)]
+    max_data_col = max(CP_DATA_COLS)
 
-    max_data_col = max(CP_DATA_COLS)  # 11
-
-    # 使用合并感知读取，自动展开 A~K 列的合并单元格
-    rows = build_merged_aware_rows(
-        ws,
-        min_row=1,
-        max_row=ws.max_row,
-        max_col=max_data_col,
-    )
+    rows = build_merged_aware_rows(ws, min_row=1, max_row=ws.max_row, max_col=max_data_col)
     wb.close()
 
-    # 读取第8行表头
     all_headers = {}
     if len(rows) >= CP_HEADER_ROW:
         header_row = rows[CP_HEADER_ROW - 1]
         for col_idx, val in enumerate(header_row, start=1):
             all_headers[col_idx] = str(val).strip() if val else ''
 
-    # 提取顶部表头信息
     header_values = extract_cp_header_values_from_rows(rows, CP_HEADER_ROW)
 
-    # 按 OP 分组，A/B/C 列向下填充
+    # 按 OP 分组
     last_op = {'A': None, 'B': None, 'C': None}
-    current_op = None
     all_data = []
     workstations = []
     op_set = set()
 
     for row_idx in range(CP_HEADER_ROW, len(rows)):
         row = rows[row_idx]
-        a_val = row[0]
-        b_val = row[1]
-        c_val = row[2]
 
-        if a_val is not None and str(a_val).strip():
-            last_op['A'] = clean_text(a_val)
-        if b_val is not None and str(b_val).strip():
-            last_op['B'] = clean_text(b_val)
-        if c_val is not None and str(c_val).strip():
-            last_op['C'] = clean_text(c_val)
+        # 优化：缓存 strip() 结果，避免重复 str().strip()
+        a_raw = row[0]
+        b_raw = row[1]
+        c_raw = row[2]
+        a_stripped = str(a_raw).strip() if a_raw is not None else ''
+        b_stripped = str(b_raw).strip() if b_raw is not None else ''
+        c_stripped = str(c_raw).strip() if c_raw is not None else ''
 
-        # 新 OP 开始
-        if (a_val is not None and str(a_val).strip()) or \
-           (b_val is not None and str(b_val).strip()) or \
-           (c_val is not None and str(c_val).strip()):
+        if a_stripped:
+            last_op['A'] = clean_text(a_raw)
+        if b_stripped:
+            last_op['B'] = clean_text(b_raw)
+        if c_stripped:
+            last_op['C'] = clean_text(c_raw)
+
+        if a_stripped or b_stripped or c_stripped:
             op_key = last_op['A'] or last_op['B'] or last_op['C']
             if op_key:
                 if op_key not in op_set:
                     op_set.add(op_key)
                     workstations.append(op_key)
-                    current_op = op_key
-                else:
-                    current_op = op_key
+                last_op['_current'] = op_key
 
         # E 列有内容才保留
-        e_val = row[4]
-        if e_val is not None and str(e_val).strip():
+        e_raw = row[4]
+        if e_raw is not None and str(e_raw).strip():
             row_data = {
-                1: last_op['A'],
-                2: last_op['B'],
-                3: last_op['C'],
-                4: row[3],    # D
-                5: row[4],    # E
-                7: row[6],    # G
-                8: row[7],    # H
-                9: row[8],    # I
-                10: row[9],   # J
-                11: row[10],  # K
+                1: last_op['A'], 2: last_op['B'], 3: last_op['C'],
+                4: row[3], 5: row[4], 7: row[6], 8: row[7],
+                9: row[8], 10: row[9], 11: row[10],
             }
             all_data.append(row_data)
 
@@ -345,9 +336,6 @@ def parse_control_plan(filepath: str) -> dict:
 
 
 def unmerge_target_area(ws, start_row: int, end_row: int):
-    """
-    一次性解除指定行范围内的所有合并单元格。
-    """
     to_unmerge = []
     for merged_range in ws.merged_cells.ranges:
         if merged_range.min_row >= start_row and merged_range.max_row <= end_row:
@@ -357,16 +345,13 @@ def unmerge_target_area(ws, start_row: int, end_row: int):
 
 
 def fill_template(cp_data: dict, selected_ws: str, header_values: dict) -> BytesIO:
-    """
-    填充 T.Q.M.013 模板。
-    """
+    """填充 T.Q.M.013 模板。"""
     if TEMPLATE_BYTES is None:
         raise FileNotFoundError("未找到 T.Q.M.013 模板文件！")
 
     wb = openpyxl.load_workbook(BytesIO(TEMPLATE_BYTES), keep_vba=True)
     ws = wb.active
 
-    # 一次性解除表头和内容区的合并单元格
     unmerge_target_area(ws, 1, CONTENT_END_ROW)
 
     # 填充表头
@@ -380,30 +365,27 @@ def fill_template(cp_data: dict, selected_ws: str, header_values: dict) -> Bytes
         if value:
             ws.cell(row=config['row'], column=config['col'], value=value)
 
-    # 按选定的 OP 筛选数据行
+    # 优化：筛选 + 去重合并为单次遍历
     ws_col = cp_data['workstation_col']
-    matched = [row for row in cp_data['data'] if row.get(ws_col) == selected_ws]
-
-    # 去重
     seen = set()
-    unique_matched = []
-    for row in matched:
-        key = tuple(row.get(k) for k in DATA_KEY_COLS)
-        if key not in seen:
-            seen.add(key)
-            unique_matched.append(row)
-
-    # 填充内容数据
     current_row = CONTENT_START_ROW
-    for row_data in unique_matched:
+
+    for row_data in cp_data['data']:
         if current_row > CONTENT_END_ROW:
             break
+        if row_data.get(ws_col) != selected_ws:
+            continue
+        key = tuple(row_data.get(k) for k in DATA_KEY_COLS)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # 直接写入，无需中间列表
         for tqm_field, cp_col in CP_TO_TQM_CONTENT.items():
-            if tqm_field in TQM013_CONTENT_COLS:
-                tqm_col = TQM013_CONTENT_COLS[tqm_field]['col']
-                value = row_data.get(cp_col)
-                if value is not None and str(value).strip():
-                    ws.cell(row=current_row, column=tqm_col, value=value)
+            tqm_col = TQM013_CONTENT_COLS[tqm_field]['col']
+            value = row_data.get(cp_col)
+            if value is not None and str(value).strip():
+                ws.cell(row=current_row, column=tqm_col, value=value)
         current_row += 1
 
     output = BytesIO()
@@ -442,8 +424,9 @@ def upload_control_plan():
     file.save(filepath)
 
     try:
+        _clean_expired_cache()
         cp_data = parse_control_plan(filepath)
-        cp_cache[session_id] = cp_data
+        cp_cache[session_id] = (cp_data, time.time())
 
         session['cp_filepath'] = filepath
         session['cp_session_id'] = session_id
@@ -474,7 +457,7 @@ def reparse_with_column():
     try:
         cp_data = parse_control_plan(cp_filepath)
         if session_id:
-            cp_cache[session_id] = cp_data
+            cp_cache[session_id] = (cp_data, time.time())
 
         return jsonify({
             'success': True,
@@ -498,14 +481,15 @@ def generate():
     if not session_id_from_body or not workstation:
         return jsonify({'success': False, 'error': '缺少必要参数'})
 
-    cp_data = cp_cache.get(session_id_from_body)
-
-    if cp_data is None:
+    cached = cp_cache.get(session_id_from_body)
+    if cached is not None:
+        cp_data, _ = cached
+    else:
         cp_filepath = session.get('cp_filepath')
         if not cp_filepath or not os.path.exists(cp_filepath):
             return jsonify({'success': False, 'error': '会话已过期，请重新上传文件'})
         cp_data = parse_control_plan(cp_filepath)
-        cp_cache[session_id_from_body] = cp_data
+        cp_cache[session_id_from_body] = (cp_data, time.time())
 
     try:
         safe_ws = str(workstation).replace(' ', '_')
@@ -556,13 +540,13 @@ def cleanup():
     return jsonify({'success': True})
 
 
-# ==================== 内嵌 HTML（略，与 v5.0 一致）====================
+# ==================== 内嵌 HTML（前端优化：事件委托 + 数组 join） ====================
 HTML_PAGE = r'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>T.QM.013 检验指导书生成器 v5.1</title>
+<title>T.QM.013 检验指导书生成器 v5.2</title>
 <style>
 :root { --primary: #2563eb; --primary-hover: #1d4ed8; --bg: #f1f5f9; --card-bg: #ffffff; --border: #e2e8f0; --text: #1e293b; --text-secondary: #64748b; --success: #16a34a; --warning: #ea580c; --danger: #dc2626; --radius: 8px; --shadow: 0 1px 3px rgba(0,0,0,0.08); }
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -646,7 +630,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
 </head>
 <body>
 <div class="header">
-    <h1>📋 T.QM.013 检验指导书生成器 v5.1</h1>
+    <h1>📋 T.QM.013 检验指导书生成器 v5.2</h1>
     <span class="status" id="statusBar">检查模板...</span>
 </div>
 <div class="main-layout">
@@ -661,7 +645,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
         <div class="card" id="step1Card">
             <h2>📁 步骤 1：上传版本控制计划</h2>
             <div class="upload-zone" id="uploadZone">
-                <div class="upload-icon"></div>
+                <div class="upload-icon">📤</div>
                 <p>拖拽 Excel 文件，或 <span class="browse-link" id="browseLink">点击浏览</span></p>
                 <p style="font-size:0.7rem;margin-top:3px;">支持 .xlsx / .xlsm / .xls</p>
                 <input type="file" id="fileInput" accept=".xlsx,.xlsm,.xls">
@@ -721,7 +705,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
             </div>
             <div class="btn-group" style="justify-content:space-between;">
                 <button class="btn btn-outline btn-sm" id="btnBackToStep2">← 返回</button>
-                <button class="btn btn-primary" id="btnGenerate"> 生成检验指导书 <span class="spinner" id="generateSpinner"></span></button>
+                <button class="btn btn-primary" id="btnGenerate">🚀 生成检验指导书 <span class="spinner" id="generateSpinner"></span></button>
             </div>
         </div>
         <div class="card hidden" id="step4Card">
@@ -732,7 +716,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC'
                 <p id="resultFilename" style="font-size:0.85rem;"></p>
             </div>
             <div class="btn-group" style="justify-content:center;">
-                <button class="btn btn-success" id="btnDownload"> 下载</button>
+                <button class="btn btn-success" id="btnDownload">📥 下载</button>
                 <button class="btn btn-outline btn-sm" onclick="resetAll()">🔄 新建</button>
             </div>
         </div>
@@ -801,11 +785,11 @@ async function handleFile(file){
 }
 
 function showHeaderPreview(headers){
-    let h='';
+    const parts=[];
     for(const [col,hdr] of Object.entries(headers)){
-        h+='<span style="margin:2px;display:inline-block;background:#e2e8f0;padding:1px 5px;border-radius:3px;">列'+col+': '+(hdr||'<i>空</i>')+'</span>';
+        parts.push('<span style="margin:2px;display:inline-block;background:#e2e8f0;padding:1px 5px;border-radius:3px;">列'+col+': '+(hdr||'<i>空</i>')+'</span>');
     }
-    $('#headerPreview').innerHTML=h;
+    $('#headerPreview').innerHTML=parts.join('');
     $('#headerPreviewBox').classList.remove('hidden');
 }
 
@@ -819,7 +803,7 @@ function renderHeaderFields(){
     $('#headerFields').innerHTML=fields.map(f=>{
         const readonly=f.k==='workstation'?' readonly':'';
         const val=f.k==='workstation'?(STATE.selectedWorkstation||''):(STATE.headerValues[f.k]||'');
-        return '<div class="map-row"><label>'+f.l+'</label><input type="text" id="header_'+f.k+'" data-field="'+f.k+'" value="'+val+'"'+readonly+'></div>';
+        return '<div class="map-row"><label>'+f.l+'</label><input type="text" id="header_'+f.k+'" data-field="'+f.k+'" value="'+val.replace(/"/g,'&quot;')+'"'+readonly+'></div>';
     }).join('');
 }
 
@@ -831,12 +815,19 @@ function renderWorkstations(f){
         $('#wsList').innerHTML='<p style="color:var(--text-secondary);padding:12px;font-size:0.8rem;">未找到工位</p>';
         return;
     }
-    $('#wsList').innerHTML=filtered.map(w=>'<span class="ws-chip'+(w===STATE.selectedWorkstation?' selected':'')+'" data-ws="'+w.replace(/"/g,'&quot;')+'">'+w+'</span>').join('');
-    $('#wsList').querySelectorAll('.ws-chip').forEach(c=>c.addEventListener('click',()=>{
-        STATE.selectedWorkstation=c.dataset.ws;$('#selectedWsDisplay').textContent=STATE.selectedWorkstation;
-        $('#btnNextToMapping').disabled=false;updatePreview();renderWorkstations($('#wsSearch').value);
-    }));
+    $('#wsList').innerHTML=filtered.map(w=>'<span class="ws-chip'+(w===STATE.selectedWorkstation?' selected':'')+'" data-ws="'+String(w).replace(/"/g,'&quot;')+'">'+w+'</span>').join('');
 }
+
+// 事件委托：在 wsList 上统一处理 chip 点击，避免逐个绑定
+$('#wsList').addEventListener('click',e=>{
+    const chip=e.target.closest('.ws-chip');
+    if(!chip)return;
+    STATE.selectedWorkstation=chip.dataset.ws;
+    $('#selectedWsDisplay').textContent=STATE.selectedWorkstation;
+    $('#btnNextToMapping').disabled=false;
+    updatePreview();
+    renderWorkstations($('#wsSearch').value);
+});
 
 $('#wsSearch').addEventListener('input',e=>renderWorkstations(e.target.value));
 $('#btnNextToMapping').addEventListener('click',()=>{
@@ -872,7 +863,6 @@ $('#btnGenerate').addEventListener('click',async()=>{
 
 $('#btnDownload').addEventListener('click',()=>{if(STATE.downloadUrl)window.open(STATE.downloadUrl,'_blank');});
 
-// 防抖版 updatePreview
 let _previewTimer=null;
 function updatePreview(){
     clearTimeout(_previewTimer);
@@ -881,27 +871,28 @@ function updatePreview(){
 
 function _doUpdatePreview(){
     const hv=STATE.headerValues||{};
-    const hasContent=STATE.selectedWorkstation;
+    const hasContent=!!STATE.selectedWorkstation;
     const filled={};
     for(const k of ['project','oem','part_no_oem','part_name','part_desc','release_date']){
         filled[k]=hv[k]?'(已填)':'';
     }
     filled['workstation']=STATE.selectedWorkstation||'(待选)';
-    let html='<table class="preview-table">';
+    const parts=[];
+    parts.push('<table class="preview-table">');
     for(let row=1;row<=35;row++){
-        html+='<tr><td class="label-cell" style="font-size:0.5rem;">'+row+'</td>';
-        if(row===3){for(let c=0;c<7;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['project']?'filled':'empty')+'">'+(filled['project']||'H3')+'</td>';for(let c=0;c<8;c++)html+='<td class="empty"></td>';}
-        else if(row===6){for(let c=0;c<4;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['oem']?'filled':'empty')+'">'+(filled['oem']||'E6')+'</td>';for(let c=0;c<10;c++)html+='<td class="empty"></td>';}
-        else if(row===8){for(let c=0;c<4;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['part_name']?'filled':'empty')+'">'+(filled['part_name']||'E8')+'</td>';for(let c=0;c<11;c++)html+='<td class="empty"></td>';}
-        else if(row===10){for(let c=0;c<5;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['part_desc']?'filled':'empty')+'">'+(filled['part_desc']||'F10')+'</td>';for(let c=0;c<10;c++)html+='<td class="empty"></td>';}
-        else if(row===13){for(let c=0;c<7;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['release_date']?'filled':'empty')+'">'+(filled['release_date']||'H13')+'</td>';for(let c=0;c<3;c++)html+='<td class="empty"></td>';html+='<td class="'+(filled['workstation']?'filled':'empty')+'">'+(filled['workstation']||'K13')+'</td>';for(let c=0;c<5;c++)html+='<td class="empty"></td>';}
-        else if(row===17){html+='<td class="col-header">内容</td><td class="col-header">内容</td><td class="col-header">C</td><td class="col-header">D</td>';for(let i=0;i<6;i++)html+='<td class="col-header">描述</td>';html+='<td class="empty"></td><td class="col-header">试验等级/设备</td><td class="col-header">试验等级/设备</td><td class="col-header">负责人</td><td class="col-header">负责人</td>';}
-        else if(row>=19 && row<=30){const cls=hasContent?'will-fill':'empty';html+='<td class="empty"></td><td class="empty"></td>';html+='<td class="'+cls+'">'+(hasContent?'C'+row:'')+'</td>';html+='<td class="empty"></td>';html+='<td class="'+cls+'">'+(hasContent?'E'+row:'')+'</td>';html+='<td class="'+cls+'">'+(hasContent?'F'+row:'')+'</td>';for(let i=0;i<2;i++)html+='<td class="empty"></td>';html+='<td class="'+cls+'">'+(hasContent?'H'+row:'')+'</td>';for(let i=0;i<3;i++)html+='<td class="empty"></td>';html+='<td class="'+cls+'">'+(hasContent?'L'+row:'')+'</td>';html+='<td class="'+cls+'">'+(hasContent?'M'+row:'')+'</td>';html+='<td class="empty"></td>';html+='<td class="'+cls+'">'+(hasContent?'O'+row:'')+'</td>';html+='<td class="empty"></td>';}
-        else{for(let c=0;c<16;c++)html+='<td class="empty"></td>';}
-        html+='</tr>';
+        parts.push('<tr><td class="label-cell" style="font-size:0.5rem;">'+row+'</td>');
+        if(row===3){for(let c=0;c<7;c++)parts.push('<td class="empty"></td>');parts.push('<td class="'+(filled['project']?'filled':'empty')+'">'+(filled['project']||'H3')+'</td>');for(let c=0;c<8;c++)parts.push('<td class="empty"></td>');}
+        else if(row===6){for(let c=0;c<4;c++)parts.push('<td class="empty"></td>');parts.push('<td class="'+(filled['oem']?'filled':'empty')+'">'+(filled['oem']||'E6')+'</td>');for(let c=0;c<10;c++)parts.push('<td class="empty"></td>');}
+        else if(row===8){for(let c=0;c<4;c++)parts.push('<td class="empty"></td>');parts.push('<td class="'+(filled['part_name']?'filled':'empty')+'">'+(filled['part_name']||'E8')+'</td>');for(let c=0;c<11;c++)parts.push('<td class="empty"></td>');}
+        else if(row===10){for(let c=0;c<5;c++)parts.push('<td class="empty"></td>');parts.push('<td class="'+(filled['part_desc']?'filled':'empty')+'">'+(filled['part_desc']||'F10')+'</td>');for(let c=0;c<10;c++)parts.push('<td class="empty"></td>');}
+        else if(row===13){for(let c=0;c<7;c++)parts.push('<td class="empty"></td>');parts.push('<td class="'+(filled['release_date']?'filled':'empty')+'">'+(filled['release_date']||'H13')+'</td>');for(let c=0;c<3;c++)parts.push('<td class="empty"></td>');parts.push('<td class="'+(filled['workstation']?'filled':'empty')+'">'+(filled['workstation']||'K13')+'</td>');for(let c=0;c<5;c++)parts.push('<td class="empty"></td>');}
+        else if(row===17){parts.push('<td class="col-header">内容</td><td class="col-header">内容</td><td class="col-header">C</td><td class="col-header">D</td>');for(let i=0;i<6;i++)parts.push('<td class="col-header">描述</td>');parts.push('<td class="empty"></td><td class="col-header">试验等级/设备</td><td class="col-header">试验等级/设备</td><td class="col-header">负责人</td><td class="col-header">负责人</td>');}
+        else if(row>=19 && row<=30){const cls=hasContent?'will-fill':'empty';parts.push('<td class="empty"></td><td class="empty"></td>');parts.push('<td class="'+cls+'">'+(hasContent?'C'+row:'')+'</td>');parts.push('<td class="empty"></td>');parts.push('<td class="'+cls+'">'+(hasContent?'E'+row:'')+'</td>');parts.push('<td class="'+cls+'">'+(hasContent?'F'+row:'')+'</td>');for(let i=0;i<2;i++)parts.push('<td class="empty"></td>');parts.push('<td class="'+cls+'">'+(hasContent?'H'+row:'')+'</td>');for(let i=0;i<3;i++)parts.push('<td class="empty"></td>');parts.push('<td class="'+cls+'">'+(hasContent?'L'+row:'')+'</td>');parts.push('<td class="'+cls+'">'+(hasContent?'M'+row:'')+'</td>');parts.push('<td class="empty"></td>');parts.push('<td class="'+cls+'">'+(hasContent?'O'+row:'')+'</td>');parts.push('<td class="empty"></td>');}
+        else{for(let c=0;c<16;c++)parts.push('<td class="empty"></td>');}
+        parts.push('</tr>');
     }
-    html+='</table>';
-    $('#previewContent').innerHTML=html;
+    parts.push('</table>');
+    $('#previewContent').innerHTML=parts.join('');
 }
 
 function resetAll(){
@@ -937,10 +928,10 @@ def main():
     port = find_free_port()
     url = f'http://127.0.0.1:{port}'
     print("=" * 55)
-    print("  T.QM.013 检验指导书生成器 v5.1 (合并单元格感知 + 优化版)")
+    print("  T.QM.013 检验指导书生成器 v5.2 (最终优化版)")
     print("=" * 55)
     print(f"  模板文件: {TEMPLATE_FILE or '❌ 未找到!'}")
-    print(f"  模板缓存: {'✅ 已缓存' if template_ok else ' 未缓存'}")
+    print(f"  模板缓存: {'✅ 已缓存' if template_ok else '❌ 未缓存'}")
     print(f"  本地地址: {url}")
     print("=" * 55)
 
